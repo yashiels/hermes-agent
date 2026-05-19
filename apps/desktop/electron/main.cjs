@@ -48,9 +48,7 @@ try {
     const path = require('node:path')
     const resourcesPath = process.resourcesPath
     if (resourcesPath) {
-      nodePty = require(
-        path.join(resourcesPath, 'native-deps', 'node-pty')
-      )
+      nodePty = require(path.join(resourcesPath, 'native-deps', 'node-pty'))
     }
   } catch {
     nodePty = null
@@ -103,7 +101,9 @@ function loadInstallStamp() {
       const parsed = JSON.parse(raw)
       if (parsed && typeof parsed === 'object' && typeof parsed.commit === 'string' && parsed.commit.length >= 7) {
         if (parsed.schemaVersion !== INSTALL_STAMP_SCHEMA_VERSION) {
-          console.warn(`[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`)
+          console.warn(
+            `[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`
+          )
           continue
         }
         return Object.freeze({
@@ -124,11 +124,15 @@ function loadInstallStamp() {
 }
 const INSTALL_STAMP = loadInstallStamp()
 if (INSTALL_STAMP) {
-  console.log(`[hermes] install stamp: ${INSTALL_STAMP.commit.slice(0, 12)}${INSTALL_STAMP.branch ? ` (${INSTALL_STAMP.branch})` : ''}${INSTALL_STAMP.dirty ? ' [DIRTY]' : ''} from ${INSTALL_STAMP.source || 'unknown'}`)
+  console.log(
+    `[hermes] install stamp: ${INSTALL_STAMP.commit.slice(0, 12)}${INSTALL_STAMP.branch ? ` (${INSTALL_STAMP.branch})` : ''}${INSTALL_STAMP.dirty ? ' [DIRTY]' : ''} from ${INSTALL_STAMP.source || 'unknown'}`
+  )
 } else if (IS_PACKAGED) {
   // Dev builds without a stamp are normal; packaged builds without one
   // mean the bootstrap won't know what to clone. Surface clearly.
-  console.error('[hermes] WARNING: no install-stamp.json found in packaged build. First-launch bootstrap will not have a pinned ref to install.')
+  console.error(
+    '[hermes] WARNING: no install-stamp.json found in packaged build. First-launch bootstrap will not have a pinned ref to install.'
+  )
 }
 
 // HERMES_HOME — the user-facing root for everything Hermes-related. Mirrors
@@ -665,6 +669,41 @@ function findOnPath(command) {
 
 function isCommandScript(command) {
   return IS_WINDOWS && /\.(cmd|bat)$/i.test(command || '')
+}
+
+function normalizeExecutablePathForCompare(commandPath) {
+  if (!commandPath) return null
+
+  let resolved = path.resolve(String(commandPath))
+  try {
+    resolved = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved)
+  } catch {
+    // Fallback to path.resolve() above.
+  }
+
+  return IS_WINDOWS ? resolved.toLowerCase() : resolved
+}
+
+function looksLikeDesktopAppBinary(commandPath) {
+  if (!IS_WINDOWS || !commandPath) return false
+
+  const normalizedCandidate = normalizeExecutablePathForCompare(commandPath)
+  const normalizedCurrentExec = normalizeExecutablePathForCompare(process.execPath)
+  if (normalizedCandidate && normalizedCurrentExec && normalizedCandidate === normalizedCurrentExec) {
+    return true
+  }
+
+  let resolved = path.resolve(String(commandPath))
+  try {
+    resolved = fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved)
+  } catch {
+    // Keep resolved path fallback.
+  }
+
+  const resourcesDir = path.join(path.dirname(resolved), 'resources')
+  return (
+    fileExists(path.join(resourcesDir, 'app.asar')) || directoryExists(path.join(resourcesDir, 'app.asar.unpacked'))
+  )
 }
 
 function isHermesSourceRoot(root) {
@@ -1304,6 +1343,13 @@ function resolveHermesBackend(dashboardArgs) {
     }
 
     if (hermesCommand) {
+      if (looksLikeDesktopAppBinary(hermesCommand)) {
+        rememberLog(`Ignoring desktop app executable on PATH while resolving Hermes CLI: ${hermesCommand}`)
+        hermesCommand = null
+      }
+    }
+
+    if (hermesCommand) {
       return {
         label: `existing Hermes CLI at ${hermesCommand}`,
         command: hermesCommand,
@@ -1498,8 +1544,7 @@ async function ensureRuntime(backend) {
     // install.ps1 succeeds. If we hit this, the user (or a deleted venv)
     // broke the invariant; tell them to re-run the install.
     throw new Error(
-      `Hermes venv missing at ${VENV_ROOT}. Re-run the desktop installer or ` +
-        '`scripts/install.ps1` to rebuild it.'
+      `Hermes venv missing at ${VENV_ROOT}. Re-run the desktop installer or ` + '`scripts/install.ps1` to rebuild it.'
     )
   }
 
