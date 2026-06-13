@@ -50,7 +50,7 @@
  * the composer remounts+refocuses whenever an overlay closes).
  */
 import { SyntaxStyle, type PasteEvent, type TextareaRenderable } from '@opentui/core'
-import { useKeyboard } from '@opentui/solid'
+import { useKeyboard, useRenderer } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
 import { MENU_MAX, routeMenuKey } from '../logic/completionMenu.ts'
@@ -299,6 +299,51 @@ export function Composer(props: {
     submitting = false
   }
 
+  /** Shared paste handling for both the focused textarea (native insert covers
+   *  small pastes) and the GLOBAL renderer paste (item: F4 — when the composer
+   *  lost focus, e.g. the transcript scrollbox grabbed it, the textarea never
+   *  sees the paste; we focus it and insert the bytes ourselves). `native` is
+   *  true when the textarea will auto-insert a small paste (focused path); on
+   *  the global path it's false, so we insert small pastes manually. Returns
+   *  whether the paste was consumed (caller preventDefault's accordingly). */
+  const applyPaste = (text: string, native: boolean): boolean => {
+    // An empty bracketed paste = an image-only clipboard (item 1) — read + attach it.
+    if (text.trim() === '') {
+      props.onImagePaste?.()
+      return true
+    }
+    // A large paste becomes a compact `[Pasted text #N +M lines]` chip instead
+    // of flooding the input; the real text is expanded back on submit.
+    if (props.pasteStore && shouldPlaceholder(text)) {
+      ta?.insertText(props.pasteStore.add(text))
+      return true
+    }
+    // Small paste: the focused textarea inserts it natively; the global path
+    // (unfocused) must insert it itself.
+    if (!native) {
+      ta?.insertText(text)
+      return true
+    }
+    return false
+  }
+
+  // F4: a paste while the composer is UNFOCUSED still lands. Paste is a
+  // renderer-level event (not routed only to the focused renderable), so a
+  // global listener focuses the textarea and applies the bytes. Guarded on
+  // `!ta.focused` so the focused path stays the textarea's own onPaste (no
+  // double insert); skipped while a blocking prompt/overlay owns the screen
+  // (the composer is unmounted then anyway).
+  const renderer = useRenderer()
+  onMount(() => {
+    const onGlobalPaste = (e: PasteEvent) => {
+      if (!ta || ta.focused || ta.isDestroyed) return
+      ta.focus()
+      const consumed = applyPaste(new TextDecoder().decode(e.bytes), false)
+      if (consumed) e.preventDefault()
+    }
+    renderer.keyInput.on('paste', onGlobalPaste)
+    onCleanup(() => renderer.keyInput.off('paste', onGlobalPaste))
+  })
   /** Refresh the line-indicator signals from the textarea (best-effort). */
   const syncCursorLine = () => {
     if (!ta || ta.isDestroyed) return
@@ -506,21 +551,9 @@ export function Composer(props: {
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}
           onPaste={(e: PasteEvent) => {
-            const text = new TextDecoder().decode(e.bytes)
-            // An empty bracketed paste = an image-only clipboard (item 1) — read + attach it.
-            if (text.trim() === '') {
-              e.preventDefault()
-              props.onImagePaste?.()
-              return
-            }
-            // A large paste becomes a compact `[Pasted text #N +M lines]` chip instead
-            // of flooding the input; the real text is expanded back on submit.
-            if (props.pasteStore && shouldPlaceholder(text)) {
-              e.preventDefault()
-              ta?.insertText(props.pasteStore.add(text))
-              return
-            }
-            // small pastes fall through to the textarea's native insert
+            // Focused path: the textarea natively inserts small pastes, so
+            // applyPaste(native=true) only consumes image/large pastes.
+            if (applyPaste(new TextDecoder().decode(e.bytes), true)) e.preventDefault()
           }}
           onCursorChange={() => syncCursorLine()}
           onContentChange={() => {
