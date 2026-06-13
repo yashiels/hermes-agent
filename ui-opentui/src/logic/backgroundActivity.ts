@@ -29,14 +29,6 @@ export interface BackgroundProcess {
   uptimeSeconds: number
 }
 
-export interface BackgroundRun {
-  id: string
-  label: string
-  status: 'running' | 'complete' | 'failed' | 'cancelled'
-  startedAt?: number
-  summary?: string
-}
-
 /** Loose-read a string field off an `unknown` object (slash.ts `readStr` style). */
 function readStr(value: unknown, key: string): string | undefined {
   if (!value || typeof value !== 'object') return undefined
@@ -63,12 +55,10 @@ function coerceLevel(value: unknown): ActivityNotification['level'] {
  * card has nothing to show). Maps snake_case `ttl_ms` → `ttlMs`, coerces a
  * garbage/missing `level` to 'info', and defaults `kind` to ''.
  *
- * id resolution (dedupe key): prefer the wire `id`, then fall back to `key`. If
- * BOTH are missing we synthesize `id = `n:${text}`` rather than minting a random
- * id — a random id would make every re-emit of the same text a NEW card, so a
- * text-derived stable id keeps dedupe (upsertNotification) working for
- * gateways that don't send ids. The original `key` (if any) is preserved
- * separately so notification.clear by key still targets the right rows.
+ * id resolution: prefer the wire `id`, then fall back to `key`, else synthesize
+ * `id = `n:${text}`` (a stable, text-derived id rather than a random one). The
+ * original `key` (if any) is preserved separately so notification.clear by key
+ * still targets the right cards.
  */
 export function parseNotification(payload: unknown): ActivityNotification | null {
   const text = readStr(payload, 'text')
@@ -85,25 +75,6 @@ export function parseNotification(payload: unknown): ActivityNotification | null
   const ttlMs = readNum(payload, 'ttl_ms')
   if (ttlMs !== undefined) out.ttlMs = ttlMs
   return out
-}
-
-/** Dedupe-by-id upsert: replace an existing item with the same id, else append.
- *  Returns a NEW array (never mutates the input). */
-export function upsertNotification(
-  list: readonly ActivityNotification[],
-  n: ActivityNotification
-): ActivityNotification[] {
-  const idx = list.findIndex(item => item.id === n.id)
-  if (idx === -1) return [...list, n]
-  const next = list.slice()
-  next[idx] = n
-  return next
-}
-
-/** Drop every notification whose `key` matches (notification.clear). Returns a
- *  NEW array. Notifications without a key are never cleared this way. */
-export function clearNotificationsByKey(list: readonly ActivityNotification[], key: string): ActivityNotification[] {
-  return list.filter(n => n.key !== key)
 }
 
 /** Parse an `agents.list` result ({processes:[...]}) → BackgroundProcess[],
@@ -134,17 +105,18 @@ export function parseProcessList(result: unknown): BackgroundProcess[] {
  *  status vocabulary is open-ended and we'd rather over-count the ambient badge
  *  than silently hide a still-live process under an unfamiliar status string.
  *  Matched case-insensitively after trimming. */
-const DONE_STATUSES = new Set(['exited', 'failed', 'complete', 'done', 'killed'])
+/** Terminal (no-longer-running) process statuses — exported as the single
+ *  source of truth (the panel imports `procIsRunning` rather than re-declaring). */
+export const DONE_STATUSES = new Set(['exited', 'failed', 'complete', 'done', 'killed'])
 
-function procIsRunning(status: string): boolean {
+/** Whether a process status is "running-ish": NOT one of DONE_STATUSES. Lenient
+ *  by design — the gateway's status vocabulary is open-ended, so we over-count
+ *  rather than hide a live process under an unfamiliar status. Case-insensitive. */
+export function procIsRunning(status: string): boolean {
   return !DONE_STATUSES.has(status.trim().toLowerCase())
 }
 
-/** Count of "currently running" things for the ambient badge: runs whose
- *  status is 'running', plus processes whose status is running-ish (anything
- *  that isn't a terminal status — see DONE_STATUSES). */
-export function runningCount(runs: readonly BackgroundRun[], procs: readonly BackgroundProcess[]): number {
-  const runningRuns = runs.filter(r => r.status === 'running').length
-  const runningProcs = procs.filter(p => procIsRunning(p.status)).length
-  return runningRuns + runningProcs
+/** Count of running background processes (the ambient `bg:` badge). */
+export function runningCount(procs: readonly BackgroundProcess[]): number {
+  return procs.filter(p => procIsRunning(p.status)).length
 }

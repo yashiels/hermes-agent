@@ -109,6 +109,7 @@ describe('store.applyInfo — chrome merge', () => {
 describe('statusSegments — progressive disclosure table (chrome v3 order)', () => {
   test('full width shows everything', () => {
     expect(statusSegments(220)).toEqual({
+      agents: true,
       ctxDetail: true,
       cost: true,
       up: true,

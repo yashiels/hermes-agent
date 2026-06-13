@@ -17,9 +17,9 @@
  *     10–14 cells by terminal width (`ctxBarCells`), vs the old 5.
  *   - Responsive = drop, don't restack: as the terminal narrows, tail segments
  *     drop WHOLE in reverse priority (mcp → bg → profile → cmp → up → cost →
- *     ctx detail collapsing to a bare `ctx: 42%`) via the pure, table-tested
- *     `statusSegments` ladder. The health dot, model and ctx % are pinned.
- *     Nothing truncates mid-segment, so the row NEVER wraps or restacks.
+ *     ctx detail collapsing to a bare `ctx: 42%`, then the `⚡ agents` chip) via
+ *     the pure, table-tested `statusSegments` ladder. The health dot, model and
+ *     ctx % are pinned. Nothing truncates mid-segment, so the row NEVER wraps.
  *
  * A pending update (`info.update_behind > 0`) BORROWS the whole line as a
  * transient notice; it dismisses on Esc or after NOTICE_TTL_MS.
@@ -28,10 +28,11 @@
  * correct blue surface), `statusFg` for the model/profile/percent, muted
  * metrics + labels, ok/warn dot, level-tinted ctx bar and cmp count.
  *
+ * Background-activity chrome (glitch 2026-06-13): `⚡ N` = running subagents
+ * (folded here from the old agents-tray line), `bg: N` = running OS background
+ * processes (polled from `agents.list`). Both hidden at zero.
+ *
  * Parity notes (data that does not reach this TUI yet — reported, not faked):
- *   - `bg: N` (background tasks): the OpenTUI store has no background-task
- *     tracking (Ink counts `prompt.background` task_ids + `background.complete`
- *     locally); the segment slot exists in `statusSegments` but renders nothing.
  *   - `display.show_cost`: Ink reads it from its `config.get` polling loop,
  *     which this TUI doesn't have — cost shows whenever `usage.cost_usd` is
  *     present instead.
@@ -43,6 +44,7 @@ import { createEffect, createMemo, createSignal, onCleanup, Show } from 'solid-j
 
 import { runningCount } from '../logic/backgroundActivity.ts'
 import type { SessionStore } from '../logic/store.ts'
+import { truncLeft, truncRight } from '../logic/truncate.ts'
 import { isTrayAgent } from './agentsTray.tsx'
 import { useDimensions } from './dimensions.tsx'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
@@ -67,6 +69,8 @@ const NOTICE_TTL_MS = 30_000
  *  Dot+model and the ctx % are pinned and never gated here; the cwd is gated
  *  by its own leftover-width budget instead. */
 export interface StatusSegments {
+  /** Running-subagents `⚡ N` chip — survives narrowest (drops last). */
+  agents: boolean
   /** Full `ctx: ███░░ 42% · 84k` read-out; false → compact `ctx: 42%`. */
   ctxDetail: boolean
   cost: boolean
@@ -74,7 +78,7 @@ export interface StatusSegments {
   up: boolean
   compressions: boolean
   profile: boolean
-  /** Background-tasks count — reserved; no store data feeds it yet (see header). */
+  /** Running OS background-processes count (`bg: N`). */
   bg: boolean
   mcp: boolean
 }
@@ -82,6 +86,7 @@ export interface StatusSegments {
 export function statusSegments(cols: number): StatusSegments {
   const w = Math.max(1, Math.floor(cols || 1))
   return {
+    agents: w >= 60,
     ctxDetail: w >= 72,
     cost: w >= 80,
     up: w >= 88,
@@ -154,18 +159,6 @@ function shortCwd(cwd: string): string {
   const home = HOME && (cwd === HOME || cwd.startsWith(HOME + '/')) ? '~' + cwd.slice(HOME.length) : cwd
   const segs = home.split('/').filter(Boolean)
   return segs.length <= 3 ? home : '…/' + segs.slice(-2).join('/')
-}
-
-/** Keep the TAIL of a string, prefixing with `…` when it must be clipped. */
-function truncLeft(s: string, max: number): string {
-  if (max <= 1) return s.length > max ? '…' : s
-  return s.length <= max ? s : '…' + s.slice(s.length - max + 1)
-}
-
-/** Keep the HEAD of a string, suffixing with `…` when it must be clipped. */
-function truncRight(s: string, max: number): string {
-  if (max <= 1) return s.length > max ? '…' : s
-  return s.length <= max ? s : s.slice(0, max - 1) + '…'
 }
 
 /** A unicode meter: `███░░` filled to `pct`% over `width` cells (Ink ctxBar). */
@@ -263,7 +256,7 @@ export function StatusBar(props: { store: SessionStore }) {
   // `bg: N` — running OS background processes (polled into the store); the
   // ambient half of the background-activity notifications (glitch 2026-06-13).
   const bgText = createMemo(() => {
-    const n = runningCount([], props.store.state.backgroundProcesses)
+    const n = runningCount(props.store.state.backgroundProcesses)
     return segs().bg && n > 0 ? `bg: ${n}` : ''
   })
   // `⚡ N` — running subagents. The ambient count lives HERE now (P4 input-density
@@ -271,7 +264,7 @@ export function StatusBar(props: { store: SessionStore }) {
   // composer — Down still expands it; this chip is the at-a-glance signal.
   const agentsText = createMemo(() => {
     const n = props.store.state.subagents.filter(isTrayAgent).length
-    return n > 0 && dims().width >= 60 ? `⚡ ${n}` : ''
+    return segs().agents && n > 0 ? `⚡ ${n}` : ''
   })
 
   // The cwd flows LAST on the same line (not right-pinned): its budget is the

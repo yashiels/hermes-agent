@@ -6,14 +6,10 @@
 import { describe, expect, test } from 'vitest'
 
 import {
-  type ActivityNotification,
   type BackgroundProcess,
-  type BackgroundRun,
-  clearNotificationsByKey,
   parseNotification,
   parseProcessList,
-  runningCount,
-  upsertNotification
+  runningCount
 } from '../logic/backgroundActivity.ts'
 
 describe('parseNotification', () => {
@@ -46,13 +42,10 @@ describe('parseNotification', () => {
     expect(n?.key).toBe('k-only')
   })
 
-  test('no id and no key → synthesized id `n:${text}` so dedupe still works', () => {
+  test('no id and no key → synthesized stable id `n:${text}`', () => {
     const n = parseNotification({ text: 'build finished' })
     expect(n?.id).toBe('n:build finished')
     expect(n?.key).toBeUndefined()
-    // two re-emits of the same text dedupe to one row
-    const list = upsertNotification(upsertNotification([], n!), parseNotification({ text: 'build finished' })!)
-    expect(list).toHaveLength(1)
   })
 
   test('id is preferred over key when both present', () => {
@@ -62,40 +55,6 @@ describe('parseNotification', () => {
   test('non-number ttl_ms is dropped (no ttlMs)', () => {
     const n = parseNotification({ id: 'a', text: 'x', ttl_ms: 'soon' })
     expect(n?.ttlMs).toBeUndefined()
-  })
-})
-
-describe('upsertNotification', () => {
-  const base: ActivityNotification = { id: 'a', kind: '', level: 'info', text: 'first' }
-
-  test('appends a new id, returns a NEW array', () => {
-    const list: readonly ActivityNotification[] = [base]
-    const next = upsertNotification(list, { id: 'b', kind: '', level: 'info', text: 'second' })
-    expect(next).toHaveLength(2)
-    expect(next).not.toBe(list)
-    expect(list).toHaveLength(1) // input untouched
-  })
-
-  test('replaces an existing id in place (dedupe)', () => {
-    const list: ActivityNotification[] = [base, { id: 'b', kind: '', level: 'info', text: 'second' }]
-    const next = upsertNotification(list, { id: 'a', kind: 'x', level: 'error', text: 'updated' })
-    expect(next).toHaveLength(2)
-    expect(next[0]).toEqual({ id: 'a', kind: 'x', level: 'error', text: 'updated' })
-    expect(next[1]!.id).toBe('b')
-  })
-})
-
-describe('clearNotificationsByKey', () => {
-  test('removes all with the matching key; keeps others and keyless rows', () => {
-    const list: ActivityNotification[] = [
-      { id: '1', key: 'k', kind: '', level: 'info', text: 'a' },
-      { id: '2', key: 'other', kind: '', level: 'info', text: 'b' },
-      { id: '3', kind: '', level: 'info', text: 'c' },
-      { id: '4', key: 'k', kind: '', level: 'info', text: 'd' }
-    ]
-    const next = clearNotificationsByKey(list, 'k')
-    expect(next.map(n => n.id)).toEqual(['2', '3'])
-    expect(next).not.toBe(list)
   })
 })
 
@@ -136,12 +95,6 @@ describe('parseProcessList', () => {
 })
 
 describe('runningCount', () => {
-  const runs: BackgroundRun[] = [
-    { id: 'r1', label: 'A', status: 'running' },
-    { id: 'r2', label: 'B', status: 'complete' },
-    { id: 'r3', label: 'C', status: 'running' },
-    { id: 'r4', label: 'D', status: 'failed' }
-  ]
   const procs: BackgroundProcess[] = [
     { command: 'a', sessionId: 's1', status: 'running', uptimeSeconds: 1 },
     { command: 'b', sessionId: 's2', status: 'exited', uptimeSeconds: 1 },
@@ -150,12 +103,12 @@ describe('runningCount', () => {
     { command: 'e', sessionId: 's5', status: 'killed', uptimeSeconds: 1 }
   ]
 
-  test('counts running runs + running-ish processes (lenient on unknown statuses)', () => {
-    // runs: r1, r3 = 2; procs: running + Sleeping = 2 (exited/DONE/killed excluded)
-    expect(runningCount(runs, procs)).toBe(4)
+  test('counts running-ish processes (lenient on unknown statuses)', () => {
+    // running + Sleeping = 2 (exited/DONE/killed excluded)
+    expect(runningCount(procs)).toBe(2)
   })
 
-  test('empty inputs → 0', () => {
-    expect(runningCount([], [])).toBe(0)
+  test('empty input → 0', () => {
+    expect(runningCount([])).toBe(0)
   })
 })

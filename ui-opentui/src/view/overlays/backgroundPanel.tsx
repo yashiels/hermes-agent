@@ -6,39 +6,24 @@
  * The gateway only exposes a single STOP-ALL (`kill_all`), NOT per-process kill,
  * so the only action is `x` → stop all (no per-row kill). `r` refreshes; the
  * controller wires both to the gateway.
- *
- * NOTE: the contract spec'd `import { BackgroundProcess } from '../../logic/store.ts'`,
- * but the type actually lives in `backgroundActivity.ts` (store.ts does not
- * re-export it). Importing from the real source keeps `npm run check` green —
- * editing store.ts to add a re-export is out of fence (controller's job).
  */
 import { type BoxRenderable } from '@opentui/core'
 import { useKeyboard } from '@opentui/solid'
 import { For, type JSXElement, onMount, Show } from 'solid-js'
 
-import type { BackgroundProcess } from '../../logic/backgroundActivity.ts'
+import { procIsRunning, type BackgroundProcess } from '../../logic/backgroundActivity.ts'
+import { truncRight } from '../../logic/truncate.ts'
 import { useDimensions } from '../dimensions.tsx'
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
-
-/** Terminal statuses (case-insensitive); anything else is treated as running —
- *  the same lenient rule the store uses (backgroundActivity `DONE_STATUSES`). */
-const DONE_STATUSES = new Set(['exited', 'failed', 'complete', 'done', 'killed'])
-const isRunning = (status: string): boolean => !DONE_STATUSES.has(status.toLowerCase())
 
 function statusColor(status: string, theme: ReturnType<typeof useTheme>): string {
   const c = theme().color
   const s = status.toLowerCase()
   if (s === 'failed' || s.includes('error')) return c.error
   if (s === 'exited' || s === 'complete' || s === 'done') return c.ok
-  if (isRunning(status)) return c.accent
+  if (procIsRunning(status)) return c.accent
   return c.muted
-}
-
-/** Keep the head of a string, ellipsizing when it must clip (one-line rows). */
-function truncRight(s: string, max: number): string {
-  if (max <= 1) return s.length > max ? '…' : s
-  return s.length <= max ? s : s.slice(0, max - 1) + '…'
 }
 
 /** Compact inline uptime: <60 → 'Ns', <3600 → 'Nm', else 'Hh MMm'. */
@@ -61,7 +46,7 @@ export function BackgroundPanel(props: {
   const dims = useDimensions()
   let rootRef: BoxRenderable | undefined
 
-  const running = () => props.processes.filter(p => isRunning(p.status)).length
+  const running = () => props.processes.filter(p => procIsRunning(p.status)).length
 
   // Focus the root so the focus-within close layer is active; refresh once on
   // open so the list is fresh.

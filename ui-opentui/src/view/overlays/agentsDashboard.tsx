@@ -13,6 +13,7 @@ import { useKeyboard } from '@opentui/solid'
 import { createSignal, For, onMount, Show } from 'solid-js'
 
 import type { SubagentInfo, TraceEntry } from '../../logic/store.ts'
+import { truncRight } from '../../logic/truncate.ts'
 import { useDimensions } from '../dimensions.tsx'
 import { useCloseLayer } from '../keymap.tsx'
 import { useTheme } from '../theme.tsx'
@@ -25,12 +26,6 @@ function statusColor(status: string, theme: ReturnType<typeof useTheme>): string
   if (status === 'tool' || status === 'working') return c.accent
   if (status.includes('error') || status === 'failed') return c.error
   return c.warn
-}
-
-/** Keep the head of a string, ellipsizing when it must clip (one-line master rows). */
-function truncRight(s: string, max: number): string {
-  if (max <= 1) return s.length > max ? '…' : s
-  return s.length <= max ? s : s.slice(0, max - 1) + '…'
 }
 
 /** Per-kind glyph + color for a trace entry — makes the detail pane read like a

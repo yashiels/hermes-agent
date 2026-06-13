@@ -594,14 +594,17 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       // Live backend: drive a session (create + optional initial prompt) concurrently.
       if (!input.fake) yield* Effect.forkScoped(bootstrapSession(gateway, store, input))
 
-      // Ambient `bg:` badge (A): poll the OS-process registry on a slow interval so
-      // the status bar reflects running background processes even with the panel
-      // closed. Cheap local RPC; scoped fiber → auto-cancelled on shutdown.
+      // Ambient `bg:` badge (A): poll the OS-process registry so the status bar
+      // reflects running background processes even with the panel closed. Cheap
+      // local RPC; scoped fiber → auto-cancelled on shutdown. Adaptive interval:
+      // most sessions have ZERO background processes, so idle-poll slowly (30s)
+      // and tighten to 8s only once something is running.
       if (!input.fake)
         yield* Effect.forkScoped(
           Effect.gen(function* () {
             while (true) {
-              yield* Effect.sleep('8 seconds')
+              const idle = store.state.backgroundProcesses.length === 0
+              yield* Effect.sleep(idle ? '30 seconds' : '8 seconds')
               yield* Effect.promise(() =>
                 backgroundOps
                   .list()
