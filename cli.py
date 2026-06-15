@@ -6893,6 +6893,138 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 return
             self._close_model_picker()
 
+    def _active_cursor_runtime(self) -> str:
+        """Return the active Cursor runtime name, or an empty string."""
+        candidates = [
+            getattr(getattr(self, "agent", None), "api_mode", ""),
+            getattr(self, "api_mode", ""),
+        ]
+        try:
+            from hermes_cli.codex_runtime_switch import get_current_runtime
+
+            candidates.append(get_current_runtime(CLI_CONFIG))
+        except Exception:
+            pass
+        for candidate in candidates:
+            mode = (candidate or "").strip().lower()
+            if mode in {"cursor_headless", "cursor_pty"}:
+                return mode
+        return ""
+
+    def _retire_cursor_runtime_sessions(self) -> None:
+        """Close Cursor runtime sessions so the next turn starts with new flags."""
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return
+        for attr in ("_cursor_pty_session", "_cursor_headless_session"):
+            session = getattr(agent, attr, None)
+            if session is None:
+                continue
+            close = getattr(session, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            try:
+                setattr(agent, attr, None)
+            except Exception:
+                pass
+
+    def _handle_cursor_model_switch(
+        self,
+        model_input: str,
+        *,
+        persist_global: bool,
+        force_refresh: bool,
+    ) -> None:
+        """Handle /model while a Cursor runtime owns model selection."""
+        from hermes_cli import cursor_models
+
+        if force_refresh:
+            cursor_models.clear_cursor_models_cache()
+            _cprint("  Cleared Cursor model cache. Refreshing...")
+
+        current = cursor_models.cursor_model_display_label(CLI_CONFIG)
+        runtime = self._active_cursor_runtime()
+        cursor_bin = (os.getenv("HERMES_CURSOR_BIN", "") or "").strip() or "agent"
+
+        def _load_models(use_cache: bool = True):
+            try:
+                return cursor_models.list_cursor_models(
+                    cursor_bin=cursor_bin,
+                    use_cache=use_cache,
+                )
+            except cursor_models.CursorModelError as exc:
+                _cprint(f"  ⚠ Could not validate Cursor models: {exc}")
+            except Exception as exc:
+                _cprint(f"  ⚠ Could not validate Cursor models: {exc}")
+            return []
+
+        if not model_input:
+            models = _load_models(use_cache=not force_refresh)
+            examples = ["auto"]
+            for item in models:
+                if item.id.lower() != "auto":
+                    examples.append(item.id)
+                if len(examples) >= 3:
+                    break
+            if len(examples) == 1:
+                examples.append("gpt-5.3-codex-low")
+            _cprint(f"  Current Cursor model: {current}")
+            _cprint(f"  Runtime: {runtime or 'cursor'}")
+            _cprint("")
+            for example in examples:
+                _cprint(f"  /model {example}")
+            _cprint("  /model <name> --global              save Cursor model")
+            _cprint("  /model <name> --provider <provider> use Hermes provider switch")
+            return
+
+        new_model = model_input.strip()
+        if not new_model:
+            _cprint(f"  Current Cursor model: {current}")
+            return
+
+        if new_model.lower() != "auto":
+            models = _load_models(use_cache=not force_refresh)
+            if models and not cursor_models.is_known_cursor_model(new_model, models):
+                _cprint(f"  ✗ Unknown Cursor model: {new_model}")
+                _cprint("    Run `/model --refresh` to refresh Cursor's model list.")
+                return
+
+        model_cfg = CLI_CONFIG.setdefault("model", {})
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+            CLI_CONFIG["model"] = model_cfg
+        old_model = current
+        model_cfg["cursor_model"] = new_model
+        self._cursor_model_override = new_model
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            try:
+                setattr(agent, "_cursor_model_override", new_model)
+            except Exception:
+                pass
+
+        self._retire_cursor_runtime_sessions()
+
+        _cprint(f"  ✓ Cursor model switched: {old_model} → {new_model}")
+        _cprint(f"    Runtime: {runtime or 'cursor'}")
+        if persist_global:
+            if save_config_value("model.cursor_model", new_model):
+                _cprint("    Saved to config.yaml (--global)")
+            else:
+                _cprint("    ⚠ Could not save config.yaml")
+        else:
+            _cprint("    (session only — add --global to persist)")
+
+        invalidate = getattr(self, "_invalidate", None)
+        if callable(invalidate):
+            try:
+                invalidate(min_interval=0.0)
+            except Exception:
+                pass
+
     def _handle_model_switch(self, cmd_original: str):
         """Handle /model command — switch model for this session.
 
@@ -6912,6 +7044,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Parse --provider, --global, and --refresh flags
         model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+
+        if not explicit_provider and self._active_cursor_runtime():
+            self._handle_cursor_model_switch(
+                model_input,
+                persist_global=persist_global,
+                force_refresh=force_refresh,
+            )
+            return
 
         # --refresh: wipe the on-disk picker cache before building the
         # provider list. Forces a live re-fetch of every authed provider's

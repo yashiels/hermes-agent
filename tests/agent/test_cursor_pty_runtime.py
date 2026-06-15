@@ -556,3 +556,53 @@ def test_run_cursor_pty_turn_uses_cursor_pty_model_fallback(monkeypatch, tmp_pat
     )
 
     assert captured["model"] == "gpt-5.3-codex-low"
+
+
+def test_run_cursor_pty_turn_prefers_agent_cursor_model_override(monkeypatch, tmp_path):
+    from agent.codex_runtime import run_cursor_pty_turn
+    from agent.transports import cursor_pty_session as cursor_session_module
+
+    captured = {}
+
+    class FakeCursorPtySession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_turn(self, prompt: str):
+            return SimpleNamespace(
+                final_text="done",
+                cursor_chat_id="cursor-chat-1",
+                usage={},
+            )
+
+    monkeypatch.delenv("HERMES_CURSOR_MODEL", raising=False)
+    monkeypatch.setattr(
+        cursor_session_module,
+        "CursorPtySession",
+        FakeCursorPtySession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"cursor_model": "auto"}},
+    )
+    agent = SimpleNamespace(
+        _cursor_pty_session=None,
+        _cursor_model_override="gpt-5.3-codex-low",
+        session_cwd=str(tmp_path),
+        session_id="hermes-a",
+        session_api_calls=0,
+        _iters_since_skill=0,
+        _skill_nudge_interval=0,
+        valid_tool_names=set(),
+        _session_db=None,
+    )
+
+    run_cursor_pty_turn(
+        agent,
+        user_message="work",
+        original_user_message="work",
+        messages=[],
+        effective_task_id="t",
+    )
+
+    assert captured["model"] == "gpt-5.3-codex-low"

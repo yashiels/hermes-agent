@@ -331,6 +331,13 @@ def _cursor_headless_model_from_config() -> str | None:
     return resolve_cursor_model(config)
 
 
+def _cursor_model_from_agent_or_config(agent) -> str | None:
+    override = getattr(agent, "_cursor_model_override", None)
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    return _cursor_headless_model_from_config()
+
+
 def _cursor_headless_workspace_from_config(default: str) -> str:
     env_workspace = (os.getenv("HERMES_CURSOR_WORKSPACE", "") or "").strip()
     candidates = [env_workspace]
@@ -383,7 +390,7 @@ def run_cursor_headless_turn(
         cwd = getattr(agent, "session_cwd", None) or os.getcwd()
         cwd = _cursor_headless_workspace_from_config(cwd)
         cursor_bin = (os.getenv("HERMES_CURSOR_BIN", "") or "").strip() or "agent"
-        cursor_model = _cursor_headless_model_from_config()
+        cursor_model = _cursor_model_from_agent_or_config(agent)
         agent._cursor_headless_session = CursorHeadlessSession(
             workspace=cwd,
             cursor_bin=cursor_bin,
@@ -481,7 +488,7 @@ def run_cursor_pty_turn(
         cwd = getattr(agent, "session_cwd", None) or os.getcwd()
         cwd = _cursor_headless_workspace_from_config(cwd)
         cursor_bin = (os.getenv("HERMES_CURSOR_BIN", "") or "").strip() or "agent"
-        cursor_model = _cursor_headless_model_from_config()
+        cursor_model = _cursor_model_from_agent_or_config(agent)
         agent._cursor_pty_session = CursorPtySession(
             hermes_session_id=getattr(agent, "session_id", None),
             workspace=cwd,
