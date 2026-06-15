@@ -6963,21 +6963,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         if not model_input:
             models = _load_models(use_cache=not force_refresh)
-            examples = ["auto"]
-            for item in models:
-                if item.id.lower() != "auto":
-                    examples.append(item.id)
-                if len(examples) >= 3:
-                    break
-            if len(examples) == 1:
-                examples.append("gpt-5.3-codex-low")
             _cprint(f"  Current Cursor model: {current}")
             _cprint(f"  Runtime: {runtime or 'cursor'}")
             _cprint("")
-            for example in examples:
-                _cprint(f"  /model {example}")
-            _cprint("  /model <name> --global              save Cursor model")
-            _cprint("  /model <name> --provider <provider> use Hermes provider switch")
+            if models:
+                _cprint("  Cursor models:")
+                for item in models:
+                    markers = []
+                    if item.is_current:
+                        markers.append("current")
+                    if item.is_default:
+                        markers.append("default")
+                    suffix = f" ({', '.join(markers)})" if markers else ""
+                    _cprint(f"  {item.id} - {item.label}{suffix}")
+                _cprint("")
+            else:
+                _cprint("  Cursor models unavailable. Run `/model --refresh` to retry.")
+                _cprint("")
+            _cprint("  Cursor model commands:")
+            _cprint("  /model <cursor-model>")
+            _cprint("  /model <cursor-model> --global      save Cursor model")
+            _cprint("")
+            _cprint("  Hermes provider models:")
+            _cprint("  /model --provider                   open Hermes provider picker")
+            _cprint("  /model <model> --provider <provider>")
+            _cprint("  /codex-runtime auto                 return /model to Hermes runtime")
             return
 
         new_model = model_input.strip()
@@ -7044,8 +7054,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Parse --provider, --global, and --refresh flags
         model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        normalized_raw_args = re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|refresh)', r'--\1', raw_args)
+        provider_flag_requested = "--provider" in normalized_raw_args.split()
+        if provider_flag_requested and not explicit_provider and model_input == "--provider":
+            model_input = ""
 
-        if not explicit_provider and self._active_cursor_runtime():
+        if not provider_flag_requested and self._active_cursor_runtime():
             self._handle_cursor_model_switch(
                 model_input,
                 persist_global=persist_global,

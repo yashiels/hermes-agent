@@ -21,7 +21,13 @@ class FakeCursorSession:
         self.closed = True
 
 
-def _make_cursor_cli(cli_mod, *, runtime: str = "cursor_pty", session=None):
+def _make_cursor_cli(
+    cli_mod,
+    *,
+    runtime: str = "cursor_pty",
+    session=None,
+    open_model_picker=None,
+):
     ui = object.__new__(cli_mod.HermesCLI)
     ui.model = "openai/gpt-oss-120b"
     ui.provider = "custom"
@@ -33,8 +39,10 @@ def _make_cursor_cli(cli_mod, *, runtime: str = "cursor_pty", session=None):
     ui._explicit_base_url = ""
     ui._pending_model_switch_note = ""
     ui._confirm_expensive_model_switch = lambda result: True
-    ui._open_model_picker = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("normal model picker opened")
+    ui._open_model_picker = open_model_picker or (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("normal model picker opened")
+        )
     )
     ui.agent = SimpleNamespace(
         api_mode=runtime,
@@ -71,6 +79,8 @@ def _install_common_patches(monkeypatch, cli_mod, *, config=None):
         lambda **kwargs: [
             CursorModel("auto", "Auto"),
             CursorModel("gpt-5.3-codex-low", "Codex 5.3 Low"),
+            CursorModel("gpt-5.3-codex-low-fast", "Codex 5.3 Low Fast"),
+            CursorModel("gpt-5.3-codex-high", "Codex 5.3 High"),
         ],
     )
     monkeypatch.setattr(
@@ -140,7 +150,13 @@ def test_cursor_model_command_no_args_shows_cursor_status(monkeypatch):
 
     out = "\n".join(printed)
     assert "Current Cursor model: auto" in out
-    assert "/model gpt-5.3-codex-low" in out
+    assert "Cursor models:" in out
+    assert "gpt-5.3-codex-low - Codex 5.3 Low" in out
+    assert "gpt-5.3-codex-low-fast - Codex 5.3 Low Fast" in out
+    assert "gpt-5.3-codex-high - Codex 5.3 High" in out
+    assert "Hermes provider models:" in out
+    assert "/model --provider" in out
+    assert "/codex-runtime auto" in out
     assert saves == []
 
 
@@ -208,3 +224,34 @@ def test_cursor_model_command_provider_flag_uses_normal_switch(monkeypatch):
     assert ("model.default", "openrouter/gpt-5") in saves
     assert ("model.provider", "openrouter") in saves
     assert all(key != "model.cursor_model" for key, _value in saves)
+
+
+def test_cursor_model_command_bare_provider_flag_opens_normal_picker(monkeypatch):
+    import cli as cli_mod
+
+    opened = []
+    ui = _make_cursor_cli(
+        cli_mod,
+        open_model_picker=lambda *args, **kwargs: opened.append((args, kwargs)),
+    )
+    printed, saves = _install_common_patches(monkeypatch, cli_mod)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        lambda ctx, max_models=50: {
+            "providers": [
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "is_current": False,
+                    "models": ["openai/gpt-5"],
+                    "total_models": 1,
+                }
+            ]
+        },
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(ui, "/model --provider")
+
+    assert opened
+    assert saves == []
+    assert "Current Cursor model" not in "\n".join(printed)
