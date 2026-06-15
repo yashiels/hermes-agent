@@ -254,6 +254,7 @@ _VALID_API_MODES = {
     # Provider-neutral because Cursor owns the model/account/credits used by
     # its subprocess.
     "cursor_headless",
+    "cursor_pty",
 }
 
 
@@ -274,7 +275,7 @@ def _maybe_apply_codex_app_server_runtime(
 ) -> str:
     """Optional opt-in: rewrite api_mode to an external agent runtime.
 
-    `model.agent_runtime: cursor_headless` is provider-neutral because Cursor
+    `model.agent_runtime: cursor_headless` / `cursor_pty` is provider-neutral because Cursor
     Agent CLI owns its account, model, tools, and credits.
 
     Legacy `model.openai_runtime: codex_app_server` rewrites only OpenAI/Codex
@@ -287,8 +288,8 @@ def _maybe_apply_codex_app_server_runtime(
     if not model_cfg:
         return api_mode
     agent_runtime = str(model_cfg.get("agent_runtime") or "").strip().lower()
-    if agent_runtime == "cursor_headless":
-        return "cursor_headless"
+    if agent_runtime in {"cursor_headless", "cursor_pty"}:
+        return agent_runtime
     if provider not in {"openai", "openai-codex"}:
         return api_mode
     runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()

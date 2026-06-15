@@ -21,7 +21,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-VALID_RUNTIMES = ("auto", "codex_app_server", "cursor_headless")
+VALID_RUNTIMES = ("auto", "codex_app_server", "cursor_headless", "cursor_pty")
+_AGENT_RUNTIMES = {"cursor_headless", "cursor_pty"}
 
 
 @dataclass
@@ -42,24 +43,27 @@ def parse_args(arg_string: str) -> tuple[Optional[str], list[str]]:
     """Parse the slash-command argument string. Returns (value, errors).
 
     No args         → return current state (value=None)
-    'auto' / 'codex_app_server' / 'cursor_headless' / 'on' / 'off' → return that value
+    'auto' / 'codex_app_server' / 'cursor_headless' / 'cursor_pty' / 'on' / 'off' → return that value
     anything else   → error
     """
     raw = (arg_string or "").strip().lower()
     if not raw:
         return None, []
+    normalized = raw.replace("-", "_")
     # Accept human-friendly synonyms
-    if raw in {"on", "codex", "enable"}:
+    if normalized in {"on", "codex", "enable"}:
         return "codex_app_server", []
-    if raw in {"cursor"}:
+    if normalized in {"cursor"}:
         return "cursor_headless", []
-    if raw in {"off", "default", "disable", "hermes"}:
+    if normalized in {"cursor_pty"}:
+        return "cursor_pty", []
+    if normalized in {"off", "default", "disable", "hermes"}:
         return "auto", []
-    if raw in VALID_RUNTIMES:
-        return raw, []
+    if normalized in VALID_RUNTIMES:
+        return normalized, []
     return None, [
         "Unknown runtime "
-        f"{raw!r}. Use one of: auto, codex_app_server, cursor_headless, on, off"
+        f"{raw!r}. Use one of: auto, codex_app_server, cursor_headless, cursor_pty, on, off"
     ]
 
 
@@ -94,11 +98,13 @@ def set_runtime(config: dict, new_value: str) -> str:
     old = get_current_runtime(config)
     if not isinstance(config.get("model"), dict):
         config["model"] = {}
-    if new_value == "cursor_headless":
+    if new_value in _AGENT_RUNTIMES:
         config["model"]["agent_runtime"] = new_value
-    elif old == "cursor_headless":
-        config["model"]["agent_runtime"] = new_value
+    elif old in _AGENT_RUNTIMES and new_value == "auto":
+        config["model"]["agent_runtime"] = "auto"
     else:
+        if old in _AGENT_RUNTIMES:
+            config["model"]["agent_runtime"] = "auto"
         config["model"]["openai_runtime"] = new_value
     return old
 
@@ -138,6 +144,17 @@ def check_cursor_binary_ok() -> tuple[bool, Optional[str]]:
     return True, output or "agent available"
 
 
+def check_cursor_pty_binary_ok() -> tuple[bool, Optional[str]]:
+    """Best-effort verification that Cursor Agent CLI matches PTY parser pin."""
+    try:
+        from agent.transports.cursor_pty import check_cursor_cli_version
+
+        version = check_cursor_cli_version("agent")
+        return True, version
+    except Exception as exc:
+        return False, str(exc)
+
+
 def apply(
     config: dict,
     new_value: Optional[str],
@@ -161,6 +178,7 @@ def apply(
     # None = not yet checked; (bool, str) = result.
     _binary_check: Optional[tuple[bool, Optional[str]]] = None
     _cursor_binary_check: Optional[tuple[bool, Optional[str]]] = None
+    _cursor_pty_binary_check: Optional[tuple[bool, Optional[str]]] = None
 
     def _check_binary_cached() -> tuple[bool, Optional[str]]:
         nonlocal _binary_check
@@ -174,10 +192,20 @@ def apply(
             _cursor_binary_check = check_cursor_binary_ok()
         return _cursor_binary_check
 
+    def _check_cursor_pty_binary_cached() -> tuple[bool, Optional[str]]:
+        nonlocal _cursor_pty_binary_check
+        if _cursor_pty_binary_check is None:
+            _cursor_pty_binary_check = check_cursor_pty_binary_ok()
+        return _cursor_pty_binary_check
+
     # Read-only call: just report state
     if new_value is None:
-        if current == "cursor_headless":
-            ok, ver = _check_cursor_binary_cached()
+        if current in _AGENT_RUNTIMES:
+            ok, ver = (
+                _check_cursor_pty_binary_cached()
+                if current == "cursor_pty"
+                else _check_cursor_binary_cached()
+            )
             msg = (
                 f"agent_runtime: {current}\n"
                 f"Cursor Agent CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'run `agent login` after installing Cursor CLI')}"
@@ -199,11 +227,12 @@ def apply(
 
     # No change requested
     if new_value == current:
+        runtime_key = "agent_runtime" if current in _AGENT_RUNTIMES else "openai_runtime"
         return CodexRuntimeStatus(
             success=True,
             new_value=current,
             old_value=current,
-            message=f"openai_runtime already set to {current}",
+            message=f"{runtime_key} already set to {current}",
         )
 
     # If switching ON, verify codex CLI is installed before persisting —
@@ -224,15 +253,19 @@ def apply(
                 codex_binary_ok=False,
                 codex_version=None,
             )
-    elif new_value == "cursor_headless":
-        ok, ver_or_msg = _check_cursor_binary_cached()
+    elif new_value in _AGENT_RUNTIMES:
+        ok, ver_or_msg = (
+            _check_cursor_pty_binary_cached()
+            if new_value == "cursor_pty"
+            else _check_cursor_binary_cached()
+        )
         if not ok:
             return CodexRuntimeStatus(
                 success=False,
                 new_value=None,
                 old_value=current,
                 message=(
-                    "Cannot enable cursor_headless runtime: "
+                    f"Cannot enable {new_value} runtime: "
                     f"{ver_or_msg or 'Cursor Agent CLI not available'}\n"
                     "Install/login with: agent login"
                 ),
@@ -253,7 +286,7 @@ def apply(
                 message=f"updated config in memory but persist failed: {exc}",
             )
 
-    runtime_key = "agent_runtime" if new_value == "cursor_headless" else "openai_runtime"
+    runtime_key = "agent_runtime" if (new_value in _AGENT_RUNTIMES or current in _AGENT_RUNTIMES) else "openai_runtime"
     msg_lines = [
         f"{runtime_key}: {current} → {new_value}",
     ]
@@ -323,14 +356,24 @@ def apply(
             "Effective on next session — current cached agent keeps "
             "the prior runtime to preserve prompt cache."
         )
-    elif new_value == "cursor_headless":
-        ok, ver = _check_cursor_binary_cached()
+    elif new_value in _AGENT_RUNTIMES:
+        ok, ver = (
+            _check_cursor_pty_binary_cached()
+            if new_value == "cursor_pty"
+            else _check_cursor_binary_cached()
+        )
         if ok:
             msg_lines.append(f"Cursor Agent CLI: {ver}")
-        msg_lines.append(
-            "Hermes turns now run through `agent -p --output-format json` "
-            "(Cursor owns terminal/file ops/MCP through its own CLI config)."
-        )
+        if new_value == "cursor_pty":
+            msg_lines.append(
+                "Hermes turns now run through a per-session Cursor Agent PTY "
+                "(Cursor owns terminal/file ops/MCP through its own CLI config)."
+            )
+        else:
+            msg_lines.append(
+                "Hermes turns now run through `agent -p --output-format json` "
+                "(Cursor owns terminal/file ops/MCP through its own CLI config)."
+            )
         msg_lines.append("Effective on next session.")
     else:
         msg_lines.append("OpenAI/Codex turns will use the default Hermes runtime.")
