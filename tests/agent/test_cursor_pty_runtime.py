@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -246,6 +247,118 @@ def test_cursor_pty_extracts_final_text_from_last_marker():
     assert extract_response_until_marker(raw_output, marker) == (
         "final line one\nfinal line two"
     )
+
+
+def test_cursor_pty_creates_chat_and_runs_print_json_resume(tmp_path):
+    from agent.transports.cursor_pty import CursorPtyTransport
+
+    runner_calls = []
+
+    def runner(cmd, **kwargs):
+        runner_calls.append((cmd, kwargs))
+        if cmd == ["agent", "create-chat"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="cursor-chat-created\n",
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "answer",
+                    "session_id": "cursor-chat-created",
+                    "usage": {
+                        "inputTokens": 2,
+                        "outputTokens": 3,
+                        "cacheReadTokens": 4,
+                        "cacheWriteTokens": 5,
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    def spawn_factory(cmd):
+        raise AssertionError("print-json runtime should not spawn a PTY process")
+
+    transport = CursorPtyTransport(
+        workspace=str(tmp_path),
+        version_checker=lambda cursor_bin: "2026.06.15-03-48-54-da23e37",
+        runner=runner,
+        spawn_factory=spawn_factory,
+        model="auto",
+    )
+
+    result = transport.run_turn("hello")
+
+    assert result.final_text == "answer"
+    assert result.cursor_chat_id == "cursor-chat-created"
+    assert runner_calls[0][0] == ["agent", "create-chat"]
+    assert runner_calls[1][0] == [
+        "agent",
+        "-p",
+        "--output-format",
+        "json",
+        "--workspace",
+        str(tmp_path),
+        "--trust",
+        "--model",
+        "auto",
+        "--resume",
+        "cursor-chat-created",
+        "hello",
+    ]
+    assert result.usage == {
+        "input_tokens": 2,
+        "output_tokens": 3,
+        "cache_read_tokens": 4,
+        "cache_write_tokens": 5,
+        "total_tokens": 14,
+    }
+
+
+def test_cursor_pty_uses_existing_chat_id_without_create_chat(tmp_path):
+    from agent.transports.cursor_pty import CursorPtyTransport
+
+    runner_calls = []
+
+    def runner(cmd, **kwargs):
+        runner_calls.append((cmd, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "answer",
+                    "session_id": "cursor-existing",
+                    "usage": {},
+                }
+            ),
+            stderr="",
+        )
+
+    def spawn_factory(cmd):
+        raise AssertionError("print-json runtime should not spawn a PTY process")
+
+    transport = CursorPtyTransport(
+        workspace=str(tmp_path),
+        cursor_chat_id="cursor-existing",
+        version_checker=lambda cursor_bin: "2026.06.15-03-48-54-da23e37",
+        runner=runner,
+        spawn_factory=spawn_factory,
+    )
+
+    result = transport.run_turn("hello")
+
+    assert result.cursor_chat_id == "cursor-existing"
+    assert len(runner_calls) == 1
+    assert runner_calls[0][0][-2:] == ["cursor-existing", "hello"]
 
 
 def test_cursor_pty_parses_about_version():

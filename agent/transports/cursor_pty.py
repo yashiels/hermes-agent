@@ -1,17 +1,24 @@
 """Cursor Agent CLI PTY transport.
 
 Cursor's supported ``agent -p`` headless mode creates one process per turn.
-This transport drives the interactive CLI over a PTY so one Hermes session can
-keep one Cursor chat process alive across turns.
+This transport drives Cursor's interactive CLI over a PTY but passes each
+prompt as the process' initial argv prompt. Follow-up text typed into the
+interactive prompt bar is intentionally avoided because that UI is not a
+stable automation protocol. A persisted Cursor chat id gives each Hermes
+session isolated cross-turn context without using global ``--continue``.
 """
 
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 import pty
 import re
 import select
+import struct
 import subprocess
+import termios
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -205,7 +212,7 @@ def extract_response_until_marker(output: str, marker: str) -> str:
 
 
 class CursorPtyTransport:
-    """Long-lived PTY session for Cursor Agent CLI interactive mode."""
+    """PTY-backed Cursor Agent CLI turn runner with per-session chat context."""
 
     def __init__(
         self,
@@ -216,6 +223,7 @@ class CursorPtyTransport:
         cursor_chat_id: Optional[str] = None,
         version_checker: Callable[[str], str] = check_cursor_cli_version,
         spawn_factory: Optional[Callable[[list[str]], tuple[Any, int]]] = None,
+        runner: Callable[..., Any] = subprocess.run,
         timeout: float = 600,
     ) -> None:
         self._workspace = workspace
@@ -224,6 +232,7 @@ class CursorPtyTransport:
         self._cursor_chat_id = cursor_chat_id
         self._version_checker = version_checker
         self._spawn_factory = spawn_factory
+        self._runner = runner
         self._timeout = timeout
         self._process: Any = None
         self._master_fd: Optional[int] = None
@@ -233,24 +242,86 @@ class CursorPtyTransport:
     def cursor_chat_id(self) -> Optional[str]:
         return self._cursor_chat_id
 
-    def build_command(self) -> list[str]:
+    def build_command(self, prompt: Optional[str] = None) -> list[str]:
         cmd = [self._cursor_bin, "--workspace", self._workspace]
         if self._model:
             cmd.extend(["--model", self._model])
         if self._cursor_chat_id:
             cmd.extend(["--resume", self._cursor_chat_id])
+        if prompt is not None:
+            cmd.append(prompt)
         return cmd
 
     def run_turn(self, prompt: str) -> CursorPtyResult:
-        self._ensure_started()
-        assert self._master_fd is not None
-        framed, marker = build_prompt_with_marker(prompt)
-        os.write(self._master_fd, framed.encode("utf-8", errors="replace") + b"\n")
-        raw_output = self._read_until_marker(marker)
+        self._ensure_cursor_cli_version()
+        self._ensure_cursor_chat_id()
+        cmd = [
+            self._cursor_bin,
+            "-p",
+            "--output-format",
+            "json",
+            "--workspace",
+            self._workspace,
+            "--trust",
+        ]
+        if self._model:
+            cmd.extend(["--model", self._model])
+        if self._cursor_chat_id:
+            cmd.extend(["--resume", self._cursor_chat_id])
+        cmd.append(prompt)
+
+        try:
+            proc = self._runner(
+                cmd,
+                text=True,
+                capture_output=True,
+                timeout=self._timeout,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise CursorPtyError(
+                "Cursor Agent CLI not found at 'agent'. Install Cursor CLI and run `agent login`."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CursorPtyError(
+                f"Cursor Agent CLI timed out after {self._timeout:g}s"
+            ) from exc
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        if proc.returncode != 0:
+            detail = (stderr or stdout or f"exit code {proc.returncode}").strip()
+            raise CursorPtyError(
+                f"Cursor Agent CLI failed: {detail}. Run `agent login` if authentication expired."
+            )
+
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise CursorPtyError(
+                "Cursor Agent CLI returned unparseable JSON output"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CursorPtyError("Cursor Agent CLI returned unparseable JSON output")
+        if payload.get("is_error"):
+            detail = str(payload.get("result") or payload.get("error") or "unknown error")
+            raise CursorPtyError(f"Cursor Agent CLI failed: {detail}")
+
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str) and session_id.strip():
+            self._cursor_chat_id = session_id.strip()
+        final_text = payload.get("result")
+        if final_text is None:
+            final_text = ""
+
+        from agent.transports.cursor_headless import _normalize_usage
+
         return CursorPtyResult(
-            final_text=extract_response_until_marker(raw_output, marker),
+            final_text=str(final_text),
             cursor_chat_id=self._cursor_chat_id,
-            raw_output=raw_output,
+            usage=_normalize_usage(payload.get("usage")),
+            raw_output=stdout,
         )
 
     def close(self) -> None:
@@ -288,14 +359,42 @@ class CursorPtyTransport:
             except Exception:
                 pass
 
-    def _ensure_started(self) -> None:
-        if self._process is not None:
-            poll = getattr(self._process, "poll", None)
-            if not callable(poll) or poll() is None:
-                return
-
+    def _ensure_cursor_cli_version(self) -> None:
+        if self.cursor_cli_version:
+            return
         self.cursor_cli_version = self._version_checker(self._cursor_bin)
-        cmd = self.build_command()
+
+    def _ensure_cursor_chat_id(self) -> None:
+        if self._cursor_chat_id:
+            return
+        try:
+            proc = self._runner(
+                [self._cursor_bin, "create-chat"],
+                text=True,
+                capture_output=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise CursorPtyError(
+                "Cursor Agent CLI not found at 'agent'. Install Cursor CLI and run `agent login`."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CursorPtyError("Cursor Agent CLI create-chat timed out") from exc
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        if proc.returncode != 0:
+            detail = (stderr or stdout or f"exit code {proc.returncode}").strip()
+            raise CursorPtyError(f"Cursor Agent CLI create-chat failed: {detail}")
+        chat_id = stdout.strip().splitlines()[-1].strip() if stdout.strip() else ""
+        if not chat_id:
+            raise CursorPtyError("Cursor Agent CLI create-chat returned no chat id")
+        self._cursor_chat_id = chat_id
+
+    def _start_turn_process(self, framed_prompt: str) -> None:
+        self.close()
+        cmd = self.build_command(framed_prompt)
         try:
             if self._spawn_factory is not None:
                 proc, master_fd = self._spawn_factory(cmd)
@@ -312,6 +411,8 @@ class CursorPtyTransport:
     def _spawn(cmd: list[str]) -> tuple[subprocess.Popen[bytes], int]:
         master_fd, slave_fd = pty.openpty()
         try:
+            winsize = struct.pack("HHHH", 40, 120, 0, 0)
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
             proc = subprocess.Popen(
                 cmd,
                 stdin=slave_fd,
