@@ -10,6 +10,8 @@ compatibility.
   is the active provider).
 * ``run_cursor_headless_turn`` — drives one turn through Cursor Agent CLI's
   supported ``agent -p --output-format json`` headless interface.
+* ``run_cursor_pty_turn`` — drives one turn through a long-lived interactive
+  Cursor Agent CLI process over a PTY.
 * ``run_codex_stream`` — streams a Codex Responses API call (the
   ``codex_responses`` api_mode).
 * ``run_codex_create_stream_fallback`` — recovery path when the
@@ -468,6 +470,108 @@ def run_cursor_headless_turn(
         "partial": False,
         "error": None,
         "cursor_session_id": getattr(result, "session_id", None),
+        **usage_result,
+    }
+
+
+def run_cursor_pty_turn(
+    agent,
+    *,
+    user_message: str,
+    original_user_message: Any,
+    messages: List[Dict[str, Any]],
+    effective_task_id: str,
+    should_review_memory: bool = False,
+) -> Dict[str, Any]:
+    """Cursor Agent CLI PTY runtime path.
+
+    Keeps one interactive Cursor process per Hermes agent/session and projects
+    its final text back into Hermes' message history.
+    """
+    from agent.transports.cursor_pty_session import CursorPtySession
+
+    if not hasattr(agent, "_cursor_pty_session") or agent._cursor_pty_session is None:
+        cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+        cwd = _cursor_headless_workspace_from_config(cwd)
+        cursor_bin = (os.getenv("HERMES_CURSOR_BIN", "") or "").strip() or "agent"
+        cursor_model = _cursor_headless_model_from_config()
+        agent._cursor_pty_session = CursorPtySession(
+            hermes_session_id=getattr(agent, "session_id", None),
+            workspace=cwd,
+            cursor_bin=cursor_bin,
+            model=cursor_model,
+        )
+
+    try:
+        result = agent._cursor_pty_session.run_turn(user_message)
+    except Exception as exc:
+        logger.exception("cursor PTY turn failed")
+        try:
+            agent._cursor_pty_session.close()
+        except Exception:
+            pass
+        agent._cursor_pty_session = None
+        return {
+            "final_response": (
+                f"Cursor PTY turn failed: {exc}. "
+                f"Run `agent login` if Cursor authentication expired."
+            ),
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": str(exc),
+        }
+
+    final_text = getattr(result, "final_text", "") or ""
+    if final_text:
+        messages.append({"role": "assistant", "content": final_text})
+
+    agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + 1
+    usage_result = _record_cursor_headless_usage(agent, result)
+    api_calls = 1
+
+    should_review_skills = False
+    if (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and getattr(agent, "_iters_since_skill", 0) >= agent._skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", set())
+    ):
+        should_review_skills = True
+        agent._iters_since_skill = 0
+
+    if final_text:
+        sync_memory = getattr(agent, "_sync_external_memory_for_turn", None)
+        if callable(sync_memory):
+            try:
+                sync_memory(
+                    original_user_message=original_user_message,
+                    final_response=final_text,
+                    interrupted=False,
+                )
+            except Exception:
+                logger.debug("external memory sync raised", exc_info=True)
+
+    if final_text and (should_review_memory or should_review_skills):
+        spawn_review = getattr(agent, "_spawn_background_review", None)
+        if callable(spawn_review):
+            try:
+                spawn_review(
+                    messages_snapshot=list(messages),
+                    review_memory=should_review_memory,
+                    review_skills=should_review_skills,
+                )
+            except Exception:
+                logger.debug("background review spawn raised", exc_info=True)
+
+    return {
+        "final_response": final_text,
+        "messages": messages,
+        "api_calls": api_calls,
+        "completed": True,
+        "partial": False,
+        "error": None,
+        "cursor_chat_id": getattr(result, "cursor_chat_id", None),
         **usage_result,
     }
 
@@ -980,6 +1084,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
 __all__ = [
     "run_codex_app_server_turn",
     "run_cursor_headless_turn",
+    "run_cursor_pty_turn",
     "run_codex_stream",
     "run_codex_create_stream_fallback",
     "_consume_codex_event_stream",

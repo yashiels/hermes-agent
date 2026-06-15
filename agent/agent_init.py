@@ -318,6 +318,7 @@ def init_agent(
         "bedrock_converse",
         "codex_app_server",
         "cursor_headless",
+        "cursor_pty",
     }:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":

@@ -289,3 +289,108 @@ def test_cursor_pty_allows_unpinned_cli_version_with_escape_hatch(monkeypatch):
     monkeypatch.setenv("HERMES_CURSOR_PTY_ALLOW_UNPINNED", "1")
 
     assert check_cursor_cli_version("agent", runner=runner) == "2099.01.01-bad"
+
+
+def test_run_cursor_pty_turn_appends_projected_messages():
+    from agent.codex_runtime import run_cursor_pty_turn
+
+    fake_result = SimpleNamespace(
+        final_text="done",
+        cursor_chat_id="cursor-chat-1",
+        usage={
+            "input_tokens": 2,
+            "output_tokens": 3,
+            "cache_read_tokens": 4,
+            "cache_write_tokens": 5,
+            "total_tokens": 14,
+        },
+    )
+    fake_session = SimpleNamespace(run_turn=lambda user_input: fake_result)
+    agent = SimpleNamespace(
+        _cursor_pty_session=fake_session,
+        session_prompt_tokens=0,
+        session_completion_tokens=0,
+        session_total_tokens=0,
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        session_reasoning_tokens=0,
+        session_api_calls=0,
+        session_estimated_cost_usd=0.0,
+        session_cost_status=None,
+        session_cost_source=None,
+        _session_db=None,
+        session_id="hermes-a",
+        _session_db_created=False,
+        model="cursor",
+        provider="cursor",
+        base_url="",
+        api_key="",
+    )
+    messages = [{"role": "user", "content": "work"}]
+
+    out = run_cursor_pty_turn(
+        agent,
+        user_message="work",
+        original_user_message="work",
+        messages=messages,
+        effective_task_id="t",
+    )
+
+    assert out["completed"] is True
+    assert out["partial"] is False
+    assert out["final_response"] == "done"
+    assert messages[-1] == {"role": "assistant", "content": "done"}
+    assert agent.session_api_calls == 1
+    assert agent.session_prompt_tokens == 11
+    assert agent.session_completion_tokens == 3
+    assert agent.session_total_tokens == 14
+    assert out["cursor_chat_id"] == "cursor-chat-1"
+
+
+def test_run_cursor_pty_turn_creates_session_with_hermes_session_id(monkeypatch, tmp_path):
+    from agent.codex_runtime import run_cursor_pty_turn
+    from agent.transports import cursor_pty_session as cursor_session_module
+
+    captured = {}
+
+    class FakeCursorPtySession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_turn(self, prompt: str):
+            return SimpleNamespace(
+                final_text="done",
+                cursor_chat_id="cursor-chat-1",
+                usage={},
+            )
+
+    monkeypatch.setenv("HERMES_CURSOR_MODEL", "auto")
+    monkeypatch.setattr(
+        cursor_session_module,
+        "CursorPtySession",
+        FakeCursorPtySession,
+    )
+    agent = SimpleNamespace(
+        _cursor_pty_session=None,
+        session_cwd=str(tmp_path),
+        session_id="hermes-a",
+        session_api_calls=0,
+        _iters_since_skill=0,
+        _skill_nudge_interval=0,
+        valid_tool_names=set(),
+        _session_db=None,
+    )
+
+    run_cursor_pty_turn(
+        agent,
+        user_message="work",
+        original_user_message="work",
+        messages=[],
+        effective_task_id="t",
+    )
+
+    assert captured["hermes_session_id"] == "hermes-a"
+    assert captured["workspace"] == str(tmp_path)
+    assert captured["model"] == "auto"
