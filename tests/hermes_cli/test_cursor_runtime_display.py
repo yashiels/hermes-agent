@@ -32,6 +32,28 @@ def _cursor_pty_config():
     }
 
 
+def test_cursor_pty_display_uses_legacy_pty_model_fallback(monkeypatch):
+    from hermes_cli.agent_runtime_display import active_model_display_label
+
+    monkeypatch.delenv("HERMES_CURSOR_MODEL", raising=False)
+    config = {
+        "model": {
+            "default": "openai/gpt-oss-120b",
+            "provider": "custom",
+            "agent_runtime": "cursor_pty",
+            "cursor_pty_model": "gpt-5.3-codex-low",
+        },
+    }
+
+    label = active_model_display_label(
+        "openai/gpt-oss-120b",
+        api_mode="cursor_pty",
+        config=config,
+    )
+
+    assert label == "cursor:pty:gpt-5.3-codex-low"
+
+
 def test_banner_shows_cursor_runtime_model_label(tmp_path):
     from hermes_cli import banner
 

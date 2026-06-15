@@ -2,30 +2,14 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 
 def cursor_headless_model_label(config: Optional[dict[str, Any]] = None) -> str:
     """Return the Cursor model label Hermes passes to `agent --model`."""
-    env_model = (os.getenv("HERMES_CURSOR_MODEL", "") or "").strip()
-    if env_model:
-        return env_model
-    config = config if isinstance(config, dict) else {}
-    model_cfg = config.get("model")
-    candidates = [config.get("HERMES_CURSOR_MODEL")]
-    if isinstance(model_cfg, dict):
-        candidates.extend(
-            [
-                model_cfg.get("cursor_model"),
-                model_cfg.get("cursor_headless_model"),
-                model_cfg.get("cursor_pty_model"),
-            ]
-        )
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return "default"
+    from hermes_cli.cursor_models import cursor_model_display_label
+
+    return cursor_model_display_label(config)
 
 
 def _runtime_from_config(config: Optional[dict[str, Any]]) -> str:

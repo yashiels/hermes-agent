@@ -316,32 +316,19 @@ def _env_truthy(name: str) -> bool:
 
 
 def _cursor_headless_model_from_config() -> str | None:
-    env_model = (os.getenv("HERMES_CURSOR_MODEL", "") or "").strip()
-    if env_model:
-        return env_model
     try:
         from hermes_cli.config import load_config
+        from hermes_cli.cursor_models import resolve_cursor_model
 
         config = load_config()
     except Exception:
-        return None
-    if not isinstance(config, dict):
-        return None
-    model_cfg = config.get("model")
-    candidates = [
-        config.get("HERMES_CURSOR_MODEL"),
-    ]
-    if isinstance(model_cfg, dict):
-        candidates.extend(
-            [
-                model_cfg.get("cursor_model"),
-                model_cfg.get("cursor_headless_model"),
-            ]
-        )
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return None
+        try:
+            from hermes_cli.cursor_models import resolve_cursor_model
+
+            return resolve_cursor_model(None)
+        except Exception:
+            return None
+    return resolve_cursor_model(config)
 
 
 def _cursor_headless_workspace_from_config(default: str) -> str:
