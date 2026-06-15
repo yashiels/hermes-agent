@@ -573,6 +573,12 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     tools = tools or []
     enabled_toolsets = enabled_toolsets or []
+    try:
+        from hermes_cli.config import load_config as _load_banner_config
+
+        _runtime_config = _load_banner_config()
+    except Exception:
+        _runtime_config = {}
 
     _, unavailable_toolsets = check_tool_availability(quiet=True)
     disabled_tools = set()
@@ -608,13 +614,27 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         _bskin = None
         _hero = HERMES_CADUCEUS
     left_lines = ["", _hero, ""]
-    model_short = model.split("/")[-1] if "/" in model else model
+    try:
+        from hermes_cli.agent_runtime_display import (
+            active_model_display_label,
+            active_provider_display_label,
+        )
+
+        display_model = active_model_display_label(model, config=_runtime_config)
+        display_provider = active_provider_display_label(
+            "Nous Research",
+            config=_runtime_config,
+        )
+    except Exception:
+        display_model = model
+        display_provider = "Nous Research"
+    model_short = display_model.split("/")[-1] if "/" in display_model else display_model
     if model_short.endswith(".gguf"):
         model_short = model_short[:-5]
     if len(model_short) > 28:
         model_short = model_short[:25] + "..."
     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
-    left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
+    left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]{display_provider}[/]")
 
     if os.getenv("HERMES_YOLO_MODE"):
         left_lines.append(f"[bold red]⚠ YOLO mode[/] [dim {dim}]— all approval prompts bypassed[/]")
@@ -745,16 +765,15 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     if mcp_connected:
         summary_parts.append(f"{mcp_connected} MCP servers")
     summary_parts.append("/help for commands")
-    # Indicate when the codex_app_server runtime is active so users
-    # understand why tool counts may not match what's actually reachable
-    # (codex builds its own tool list inside the spawned subprocess).
+    # Indicate when an external agent runtime is active so users understand
+    # why the visible Hermes tools/model may differ from the subprocess.
     try:
-        from hermes_cli.codex_runtime_switch import get_current_runtime
-        from hermes_cli.config import load_config as _load_cfg
-        if get_current_runtime(_load_cfg()) == "codex_app_server":
+        from hermes_cli.agent_runtime_display import active_runtime_summary
+
+        runtime_summary = active_runtime_summary(_runtime_config)
+        if runtime_summary:
             right_lines.append(
-                f"[bold {accent}]Runtime:[/] [{text}]codex app-server[/] "
-                f"[dim {dim}](terminal/file ops/MCP run inside codex)[/]"
+                f"[bold {accent}]Runtime:[/] [{text}]{runtime_summary}[/]"
             )
     except Exception:
         pass

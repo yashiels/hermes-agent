@@ -3883,6 +3883,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # _try_activate_fallback() switches provider/model.
         agent = getattr(self, "agent", None)
         model_name = (getattr(agent, "model", None) or self.model or "unknown")
+        try:
+            from hermes_cli.agent_runtime_display import active_model_display_label
+
+            model_name = active_model_display_label(
+                model_name,
+                api_mode=getattr(agent, "api_mode", None)
+                or getattr(self, "api_mode", None),
+                config=CLI_CONFIG,
+            )
+        except Exception:
+            pass
         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
         if model_short.endswith(".gguf"):
             model_short = model_short[:-5]
@@ -5484,8 +5495,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             tool_count = len(tools) if tools else 0
             tool_status = f"{tool_count} tools"
 
+        display_model = self.model
+        display_provider = self.provider
+        try:
+            from hermes_cli.agent_runtime_display import (
+                active_model_display_label,
+                active_provider_display_label,
+            )
+
+            display_model = active_model_display_label(
+                display_model,
+                api_mode=getattr(self, "api_mode", None),
+                config=CLI_CONFIG,
+            )
+            display_provider = active_provider_display_label(
+                display_provider,
+                api_mode=getattr(self, "api_mode", None),
+                config=CLI_CONFIG,
+            )
+        except Exception:
+            pass
+
         # Format model name (shorten if needed)
-        model_short = self.model.split("/")[-1] if "/" in self.model else self.model
+        model_short = display_model.split("/")[-1] if "/" in display_model else display_model
         if len(model_short) > 30:
             model_short = model_short[:27] + "..."
 
@@ -5508,7 +5540,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if self.enabled_toolsets and "all" not in self.enabled_toolsets:
             toolsets_info = f" [dim {separator_color}]·[/] [{label_color}]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
-        provider_info = f" [dim {separator_color}]·[/] [dim]provider: {self.provider}[/]"
+        provider_info = f" [dim {separator_color}]·[/] [dim]provider: {display_provider}[/]"
         if self._provider_source:
             provider_info += f" [dim {separator_color}]·[/] [dim]auth: {self._provider_source}[/]"
 

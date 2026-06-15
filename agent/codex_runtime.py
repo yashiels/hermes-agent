@@ -8,6 +8,8 @@ compatibility.
 * ``run_codex_app_server_turn`` — drives one turn through the
   ``codex_app_server`` subprocess client (used when a Codex CLI install
   is the active provider).
+* ``run_cursor_headless_turn`` — drives one turn through Cursor Agent CLI's
+  supported ``agent -p --output-format json`` headless interface.
 * ``run_codex_stream`` — streams a Codex Responses API call (the
   ``codex_responses`` api_mode).
 * ``run_codex_create_stream_fallback`` — recovery path when the
@@ -170,6 +172,303 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         if cost_result.amount_usd is not None else None,
         "cost_status": cost_result.status,
         "cost_source": cost_result.source,
+    }
+
+
+def _record_cursor_headless_usage(agent, result) -> dict[str, Any]:
+    """Translate Cursor headless usage into Hermes accounting."""
+    agent.session_api_calls += 1
+
+    usage = getattr(result, "usage", None)
+    if not isinstance(usage, dict) or not usage:
+        if getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
+            try:
+                if not getattr(agent, "_session_db_created", False):
+                    ensure_session = getattr(agent, "_ensure_db_session", None)
+                    if callable(ensure_session):
+                        ensure_session()
+                agent._session_db.update_token_counts(
+                    agent.session_id,
+                    model="cursor",
+                    api_call_count=1,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Cursor headless api-call persistence failed (session=%s): %s",
+                    getattr(agent, "session_id", None),
+                    exc,
+                )
+        return {}
+
+    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+    input_tokens = _coerce_usage_int(usage.get("input_tokens"))
+    output_tokens = _coerce_usage_int(usage.get("output_tokens"))
+    cache_read_tokens = _coerce_usage_int(usage.get("cache_read_tokens"))
+    cache_write_tokens = _coerce_usage_int(usage.get("cache_write_tokens"))
+    reported_total = _coerce_usage_int(usage.get("total_tokens"))
+
+    canonical_usage = CanonicalUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        reasoning_tokens=0,
+        raw_usage=usage,
+    )
+    prompt_tokens = canonical_usage.prompt_tokens
+    completion_tokens = canonical_usage.output_tokens
+    total_tokens = reported_total or canonical_usage.total_tokens
+    usage_dict = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens": canonical_usage.input_tokens,
+        "output_tokens": canonical_usage.output_tokens,
+        "cache_read_tokens": canonical_usage.cache_read_tokens,
+        "cache_write_tokens": canonical_usage.cache_write_tokens,
+        "reasoning_tokens": canonical_usage.reasoning_tokens,
+    }
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        try:
+            compressor.update_from_response(usage_dict)
+        except Exception:
+            logger.debug("cursor headless usage update failed", exc_info=True)
+
+    agent.session_prompt_tokens += prompt_tokens
+    agent.session_completion_tokens += completion_tokens
+    agent.session_total_tokens += total_tokens
+    agent.session_input_tokens += canonical_usage.input_tokens
+    agent.session_output_tokens += canonical_usage.output_tokens
+    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
+    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
+    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+    cost_result = estimate_usage_cost(
+        "cursor",
+        canonical_usage,
+        provider="cursor",
+        base_url="",
+        api_key="",
+    )
+    if cost_result.amount_usd is not None:
+        agent.session_estimated_cost_usd = (
+            getattr(agent, "session_estimated_cost_usd", 0.0)
+            + float(cost_result.amount_usd)
+        )
+    agent.session_cost_status = cost_result.status
+    agent.session_cost_source = cost_result.source
+
+    if getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
+        try:
+            if not getattr(agent, "_session_db_created", False):
+                ensure_session = getattr(agent, "_ensure_db_session", None)
+                if callable(ensure_session):
+                    ensure_session()
+            agent._session_db.update_token_counts(
+                agent.session_id,
+                input_tokens=canonical_usage.input_tokens,
+                output_tokens=canonical_usage.output_tokens,
+                cache_read_tokens=canonical_usage.cache_read_tokens,
+                cache_write_tokens=canonical_usage.cache_write_tokens,
+                reasoning_tokens=canonical_usage.reasoning_tokens,
+                estimated_cost_usd=float(cost_result.amount_usd)
+                if cost_result.amount_usd is not None else None,
+                cost_status=cost_result.status,
+                cost_source=cost_result.source,
+                billing_provider="cursor",
+                billing_base_url="",
+                billing_mode="subscription_included"
+                if cost_result.status == "included" else None,
+                model="cursor",
+                api_call_count=1,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Cursor headless token persistence failed (session=%s, tokens=%d): %s",
+                getattr(agent, "session_id", None),
+                total_tokens,
+                exc,
+            )
+
+    return {
+        **usage_dict,
+        "last_prompt_tokens": prompt_tokens,
+        "estimated_cost_usd": float(cost_result.amount_usd)
+        if cost_result.amount_usd is not None else None,
+        "cost_status": cost_result.status,
+        "cost_source": cost_result.source,
+    }
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "y",
+    }
+
+
+def _cursor_headless_model_from_config() -> str | None:
+    env_model = (os.getenv("HERMES_CURSOR_MODEL", "") or "").strip()
+    if env_model:
+        return env_model
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        return None
+    if not isinstance(config, dict):
+        return None
+    model_cfg = config.get("model")
+    candidates = [
+        config.get("HERMES_CURSOR_MODEL"),
+    ]
+    if isinstance(model_cfg, dict):
+        candidates.extend(
+            [
+                model_cfg.get("cursor_model"),
+                model_cfg.get("cursor_headless_model"),
+            ]
+        )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _cursor_headless_workspace_from_config(default: str) -> str:
+    env_workspace = (os.getenv("HERMES_CURSOR_WORKSPACE", "") or "").strip()
+    candidates = [env_workspace]
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        config = None
+    if isinstance(config, dict):
+        candidates.append(config.get("HERMES_CURSOR_WORKSPACE"))
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, dict):
+            candidates.extend(
+                [
+                    model_cfg.get("cursor_workspace"),
+                    model_cfg.get("cursor_headless_workspace"),
+                ]
+            )
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        workspace = os.path.abspath(os.path.expanduser(os.path.expandvars(candidate.strip())))
+        if os.path.isdir(workspace):
+            return workspace
+        logger.warning(
+            "Ignoring invalid Cursor workspace override: %s",
+            candidate,
+        )
+    return default
+
+
+def run_cursor_headless_turn(
+    agent,
+    *,
+    user_message: str,
+    original_user_message: Any,
+    messages: List[Dict[str, Any]],
+    effective_task_id: str,
+    should_review_memory: bool = False,
+) -> Dict[str, Any]:
+    """Cursor Agent CLI runtime path.
+
+    Hands the entire turn to Cursor's supported headless command and projects
+    the final text back into Hermes' message history.
+    """
+    from agent.transports.cursor_headless import CursorHeadlessSession
+
+    if not hasattr(agent, "_cursor_headless_session") or agent._cursor_headless_session is None:
+        cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+        cwd = _cursor_headless_workspace_from_config(cwd)
+        cursor_bin = (os.getenv("HERMES_CURSOR_BIN", "") or "").strip() or "agent"
+        cursor_model = _cursor_headless_model_from_config()
+        agent._cursor_headless_session = CursorHeadlessSession(
+            workspace=cwd,
+            cursor_bin=cursor_bin,
+            force=_env_truthy("HERMES_CURSOR_FORCE"),
+            model=cursor_model,
+        )
+
+    try:
+        result = agent._cursor_headless_session.run_turn(user_message)
+    except Exception as exc:
+        logger.exception("cursor headless turn failed")
+        agent._cursor_headless_session = None
+        return {
+            "final_response": (
+                f"Cursor headless turn failed: {exc}. "
+                f"Run `agent login` if Cursor authentication expired."
+            ),
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": str(exc),
+        }
+
+    final_text = getattr(result, "final_text", "") or ""
+    if final_text:
+        messages.append({"role": "assistant", "content": final_text})
+
+    agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + 1
+    usage_result = _record_cursor_headless_usage(agent, result)
+    api_calls = 1
+
+    should_review_skills = False
+    if (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and getattr(agent, "_iters_since_skill", 0) >= agent._skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", set())
+    ):
+        should_review_skills = True
+        agent._iters_since_skill = 0
+
+    if final_text:
+        sync_memory = getattr(agent, "_sync_external_memory_for_turn", None)
+        if callable(sync_memory):
+            try:
+                sync_memory(
+                    original_user_message=original_user_message,
+                    final_response=final_text,
+                    interrupted=False,
+                )
+            except Exception:
+                logger.debug("external memory sync raised", exc_info=True)
+
+    if final_text and (should_review_memory or should_review_skills):
+        spawn_review = getattr(agent, "_spawn_background_review", None)
+        if callable(spawn_review):
+            try:
+                spawn_review(
+                    messages_snapshot=list(messages),
+                    review_memory=should_review_memory,
+                    review_skills=should_review_skills,
+                )
+            except Exception:
+                logger.debug("background review spawn raised", exc_info=True)
+
+    return {
+        "final_response": final_text,
+        "messages": messages,
+        "api_calls": api_calls,
+        "completed": True,
+        "partial": False,
+        "error": None,
+        "cursor_session_id": getattr(result, "session_id", None),
+        **usage_result,
     }
 
 
@@ -680,6 +979,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
 
 __all__ = [
     "run_codex_app_server_turn",
+    "run_cursor_headless_turn",
     "run_codex_stream",
     "run_codex_create_stream_fallback",
     "_consume_codex_event_stream",

@@ -144,6 +144,15 @@ def test_estimate_usage_cost_marks_subscription_routes_included():
     assert result.status == "included"
     assert float(result.amount_usd) == 0.0
 
+    cursor_result = estimate_usage_cost(
+        "cursor",
+        CanonicalUsage(input_tokens=1000, output_tokens=500),
+        provider="cursor",
+    )
+
+    assert cursor_result.status == "included"
+    assert float(cursor_result.amount_usd) == 0.0
+
 
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):
     monkeypatch.setattr(

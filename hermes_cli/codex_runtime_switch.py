@@ -14,13 +14,14 @@ config value. This module just persists the value and reports the change.
 from __future__ import annotations
 
 import logging
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-VALID_RUNTIMES = ("auto", "codex_app_server")
+VALID_RUNTIMES = ("auto", "codex_app_server", "cursor_headless")
 
 
 @dataclass
@@ -41,7 +42,7 @@ def parse_args(arg_string: str) -> tuple[Optional[str], list[str]]:
     """Parse the slash-command argument string. Returns (value, errors).
 
     No args         → return current state (value=None)
-    'auto' / 'codex_app_server' / 'on' / 'off' → return that value
+    'auto' / 'codex_app_server' / 'cursor_headless' / 'on' / 'off' → return that value
     anything else   → error
     """
     raw = (arg_string or "").strip().lower()
@@ -50,26 +51,36 @@ def parse_args(arg_string: str) -> tuple[Optional[str], list[str]]:
     # Accept human-friendly synonyms
     if raw in {"on", "codex", "enable"}:
         return "codex_app_server", []
+    if raw in {"cursor"}:
+        return "cursor_headless", []
     if raw in {"off", "default", "disable", "hermes"}:
         return "auto", []
     if raw in VALID_RUNTIMES:
         return raw, []
     return None, [
-        f"Unknown runtime {raw!r}. Use one of: auto, codex_app_server, on, off"
+        "Unknown runtime "
+        f"{raw!r}. Use one of: auto, codex_app_server, cursor_headless, on, off"
     ]
 
 
 def get_current_runtime(config: dict) -> str:
-    """Read the current `model.openai_runtime` value from a config dict.
-    Returns 'auto' for unset / empty / unrecognized values."""
+    """Read the configured external agent runtime from a config dict.
+
+    ``model.agent_runtime`` is the provider-neutral selector. Legacy
+    ``model.openai_runtime`` remains supported for Codex compatibility.
+    Returns 'auto' for unset / empty / unrecognized values.
+    """
     if not isinstance(config, dict):
         return "auto"
     model_cfg = config.get("model") or {}
     if not isinstance(model_cfg, dict):
         return "auto"
-    value = str(model_cfg.get("openai_runtime") or "").strip().lower()
-    if value in VALID_RUNTIMES:
-        return value
+    agent_value = str(model_cfg.get("agent_runtime") or "").strip().lower()
+    if agent_value in VALID_RUNTIMES and agent_value != "auto":
+        return agent_value
+    openai_value = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    if openai_value in VALID_RUNTIMES:
+        return openai_value
     return "auto"
 
 
@@ -83,7 +94,12 @@ def set_runtime(config: dict, new_value: str) -> str:
     old = get_current_runtime(config)
     if not isinstance(config.get("model"), dict):
         config["model"] = {}
-    config["model"]["openai_runtime"] = new_value
+    if new_value == "cursor_headless":
+        config["model"]["agent_runtime"] = new_value
+    elif old == "cursor_headless":
+        config["model"]["agent_runtime"] = new_value
+    else:
+        config["model"]["openai_runtime"] = new_value
     return old
 
 
@@ -96,6 +112,30 @@ def check_codex_binary_ok() -> tuple[bool, Optional[str]]:
         return check_codex_binary()
     except Exception as exc:  # pragma: no cover
         return False, f"codex check failed: {exc}"
+
+
+def check_cursor_binary_ok() -> tuple[bool, Optional[str]]:
+    """Best-effort verification that Cursor Agent CLI is installed."""
+    try:
+        proc = subprocess.run(
+            ["agent", "--version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "Cursor Agent CLI not found at 'agent'. Install Cursor CLI."
+    except subprocess.TimeoutExpired:
+        return False, "Cursor Agent CLI check timed out"
+    except Exception as exc:  # pragma: no cover
+        return False, f"Cursor Agent CLI check failed: {exc}"
+
+    output = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return False, output or f"agent --version exited {proc.returncode}"
+    return True, output or "agent available"
 
 
 def apply(
@@ -116,11 +156,11 @@ def apply(
     """
     current = get_current_runtime(config)
 
-    # Cache the codex binary check for this apply() call. Subprocess spawn
-    # is cheap (~50ms for `codex --version`), but we'd otherwise call it up
-    # to 3 times in the enable path (read-only/state, gate, success message).
+    # Cache binary checks for this apply() call. Subprocess spawn is cheap,
+    # but the enable path needs the same result in several places.
     # None = not yet checked; (bool, str) = result.
     _binary_check: Optional[tuple[bool, Optional[str]]] = None
+    _cursor_binary_check: Optional[tuple[bool, Optional[str]]] = None
 
     def _check_binary_cached() -> tuple[bool, Optional[str]]:
         nonlocal _binary_check
@@ -128,13 +168,26 @@ def apply(
             _binary_check = check_codex_binary_ok()
         return _binary_check
 
+    def _check_cursor_binary_cached() -> tuple[bool, Optional[str]]:
+        nonlocal _cursor_binary_check
+        if _cursor_binary_check is None:
+            _cursor_binary_check = check_cursor_binary_ok()
+        return _cursor_binary_check
+
     # Read-only call: just report state
     if new_value is None:
-        ok, ver = _check_binary_cached()
-        msg = (
-            f"openai_runtime: {current}\n"
-            f"codex CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}"
-        )
+        if current == "cursor_headless":
+            ok, ver = _check_cursor_binary_cached()
+            msg = (
+                f"agent_runtime: {current}\n"
+                f"Cursor Agent CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'run `agent login` after installing Cursor CLI')}"
+            )
+        else:
+            ok, ver = _check_binary_cached()
+            msg = (
+                f"openai_runtime: {current}\n"
+                f"codex CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}"
+            )
         return CodexRuntimeStatus(
             success=True,
             new_value=current,
@@ -171,6 +224,21 @@ def apply(
                 codex_binary_ok=False,
                 codex_version=None,
             )
+    elif new_value == "cursor_headless":
+        ok, ver_or_msg = _check_cursor_binary_cached()
+        if not ok:
+            return CodexRuntimeStatus(
+                success=False,
+                new_value=None,
+                old_value=current,
+                message=(
+                    "Cannot enable cursor_headless runtime: "
+                    f"{ver_or_msg or 'Cursor Agent CLI not available'}\n"
+                    "Install/login with: agent login"
+                ),
+                codex_binary_ok=False,
+                codex_version=None,
+            )
 
     set_runtime(config, new_value)
     if persist_callback is not None:
@@ -185,8 +253,9 @@ def apply(
                 message=f"updated config in memory but persist failed: {exc}",
             )
 
+    runtime_key = "agent_runtime" if new_value == "cursor_headless" else "openai_runtime"
     msg_lines = [
-        f"openai_runtime: {current} → {new_value}",
+        f"{runtime_key}: {current} → {new_value}",
     ]
     if new_value == "codex_app_server":
         ok, ver = _check_binary_cached()
@@ -254,6 +323,15 @@ def apply(
             "Effective on next session — current cached agent keeps "
             "the prior runtime to preserve prompt cache."
         )
+    elif new_value == "cursor_headless":
+        ok, ver = _check_cursor_binary_cached()
+        if ok:
+            msg_lines.append(f"Cursor Agent CLI: {ver}")
+        msg_lines.append(
+            "Hermes turns now run through `agent -p --output-format json` "
+            "(Cursor owns terminal/file ops/MCP through its own CLI config)."
+        )
+        msg_lines.append("Effective on next session.")
     else:
         msg_lines.append("OpenAI/Codex turns will use the default Hermes runtime.")
         msg_lines.append("Effective on next session.")

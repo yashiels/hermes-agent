@@ -250,6 +250,10 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Optional opt-in: hand the entire turn to Cursor Agent CLI headless mode.
+    # Provider-neutral because Cursor owns the model/account/credits used by
+    # its subprocess.
+    "cursor_headless",
 }
 
 
@@ -268,18 +272,23 @@ def _maybe_apply_codex_app_server_runtime(
     api_mode: str,
     model_cfg: Optional[Dict[str, Any]],
 ) -> str:
-    """Optional opt-in: rewrite api_mode → "codex_app_server" for OpenAI/Codex
-    providers when the user has explicitly enabled that runtime via
-    `model.openai_runtime: codex_app_server` in config.yaml.
+    """Optional opt-in: rewrite api_mode to an external agent runtime.
+
+    `model.agent_runtime: cursor_headless` is provider-neutral because Cursor
+    Agent CLI owns its account, model, tools, and credits.
+
+    Legacy `model.openai_runtime: codex_app_server` rewrites only OpenAI/Codex
+    providers when the user has explicitly enabled that runtime.
 
     Default behavior is preserved: when the key is unset, "auto", or empty,
-    this function is a no-op. Only providers in {"openai", "openai-codex"}
-    are eligible — other providers (anthropic, openrouter, etc.) cannot be
-    rerouted through codex.
+    this function is a no-op.
 
     Returns the (possibly-rewritten) api_mode."""
     if not model_cfg:
         return api_mode
+    agent_runtime = str(model_cfg.get("agent_runtime") or "").strip().lower()
+    if agent_runtime == "cursor_headless":
+        return "cursor_headless"
     if provider not in {"openai", "openai-codex"}:
         return api_mode
     runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
@@ -976,11 +985,20 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
+    api_mode = (
+        _parse_api_mode(model_cfg.get("api_mode"))
+        or _detect_api_mode_for_url(base_url)
+        or "chat_completions"
+    )
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=effective_provider,
+        api_mode=api_mode,
+        model_cfg=model_cfg,
+    )
+
     return {
         "provider": effective_provider,
-        "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
-        or _detect_api_mode_for_url(base_url)
-        or "chat_completions",
+        "api_mode": api_mode,
         "base_url": base_url,
         "api_key": api_key,
         "source": source,

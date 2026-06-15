@@ -509,13 +509,18 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
-    # Optional opt-in runtime: if api_mode == codex_app_server, hand the
-    # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
+    # Optional opt-in runtimes: hand the entire turn to an external agent
+    # process. Default Hermes path is bypassed entirely.
     if agent.api_mode == "codex_app_server":
         return agent._run_codex_app_server_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+    if agent.api_mode == "cursor_headless":
+        return agent._run_cursor_headless_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
