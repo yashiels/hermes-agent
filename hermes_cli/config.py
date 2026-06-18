@@ -2468,6 +2468,10 @@ DEFAULT_CONFIG = {
         # the sweep on every CLI invocation).  Tracked via state_meta in
         # state.db itself, so it's shared across all processes.
         "min_interval_hours": 24,
+        # When true (default), archive Discord threads whose Hermes sessions
+        # were pruned and remove their sessions.json index entries. Requires
+        # DISCORD_BOT_TOKEN and Manage Threads permission for the bot role.
+        "archive_discord_threads_on_prune": True,
         # Legacy per-session JSON snapshot writer.  When true, the agent
         # rewrites ``~/.hermes/sessions/session_{sid}.json`` on every turn
         # boundary with the full message list.  state.db is canonical and

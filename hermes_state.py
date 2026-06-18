@@ -4040,6 +4040,8 @@ class SessionDB:
         older_than_days: int = 90,
         source: str = None,
         sessions_dir: Optional[Path] = None,
+        archive_discord_threads: Optional[bool] = None,
+        exclude_discord_thread_ids: Optional[List[str]] = None,
     ) -> int:
         """Delete sessions older than N days. Returns count of deleted sessions.
 
@@ -4049,7 +4051,14 @@ class SessionDB:
         on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
+
+        When Discord is configured and
+        ``sessions.archive_discord_threads_on_prune`` is enabled (default),
+        also archives Discord threads tied to pruned sessions via
+        ``sessions.json`` origin metadata and removes those index entries.
+        Stats are stored on ``last_prune_discord_archive`` for CLI reporting.
         """
+        self.last_prune_discord_archive = None
         cutoff = time.time() - (older_than_days * 86400)
         removed_ids: list[str] = []
 
@@ -4088,6 +4097,24 @@ class SessionDB:
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+
+        if removed_ids and sessions_dir is not None:
+            try:
+                from hermes_cli.discord_thread_archive import (
+                    archive_threads_for_removed_sessions,
+                )
+
+                self.last_prune_discord_archive = archive_threads_for_removed_sessions(
+                    removed_ids,
+                    sessions_dir,
+                    enabled=archive_discord_threads,
+                    exclude_thread_ids=exclude_discord_thread_ids,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Discord thread archive after session prune failed: %s", exc
+                )
+
         return count
 
     # ── Meta key/value (for scheduler bookkeeping) ──
@@ -4637,6 +4664,8 @@ class SessionDB:
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
+        archive_discord_threads: Optional[bool] = None,
+        exclude_discord_thread_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
 
@@ -4674,8 +4703,12 @@ class SessionDB:
             pruned = self.prune_sessions(
                 older_than_days=retention_days,
                 sessions_dir=sessions_dir,
+                archive_discord_threads=archive_discord_threads,
+                exclude_discord_thread_ids=exclude_discord_thread_ids,
             )
             result["pruned"] = pruned
+            if self.last_prune_discord_archive:
+                result["discord_threads"] = dict(self.last_prune_discord_archive)
 
             # Only VACUUM if we actually freed rows — VACUUM on a tight DB
             # is wasted I/O. Threshold keeps small DBs from paying the cost.

@@ -6972,7 +6972,11 @@ async def prune_sessions_endpoint(body: SessionPrune):
             source=(body.source or None),
             sessions_dir=sessions_dir if sessions_dir.exists() else None,
         )
-        return {"ok": True, "removed": removed}
+        payload: Dict[str, Any] = {"ok": True, "removed": removed}
+        archive = getattr(db, "last_prune_discord_archive", None)
+        if archive:
+            payload["discord_threads"] = archive
+        return payload
     finally:
         db.close()
 

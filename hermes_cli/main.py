@@ -12304,6 +12304,23 @@ def main():
                 older_than_days=days, source=args.source, sessions_dir=sessions_dir
             )
             print(f"Pruned {count} session(s).")
+            archive = getattr(db, "last_prune_discord_archive", None) or {}
+            if archive.get("archived"):
+                print(
+                    f"Archived {archive['archived']} Discord thread(s) "
+                    f"({archive.get('skipped', 0)} already archived, "
+                    f"{archive.get('errors', 0)} errors)."
+                )
+            elif archive.get("errors"):
+                print(
+                    f"Discord thread archive: {archive['errors']} error(s) "
+                    f"({archive.get('threads_found', 0)} thread(s) matched)."
+                )
+            if archive.get("sessions_json_removed"):
+                print(
+                    f"Removed {archive['sessions_json_removed']} stale "
+                    f"sessions.json entr{'y' if archive['sessions_json_removed'] == 1 else 'ies'}."
+                )
 
         elif action == "rename":
             resolved_session_id = db.resolve_session_id(args.session_id)
