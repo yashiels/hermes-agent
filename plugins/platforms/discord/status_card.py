@@ -44,6 +44,11 @@ _TASK_MARKERS = {
     "failed": "✗",
     "error": "✗",
 }
+_TERMINAL_ACTIVE_MARKERS = {
+    "failed": "✗",
+    "interrupted": "⏹",
+    "interrupted-restart": "⏹",
+}
 
 
 def _elapsed_text(elapsed_s: float) -> str:
@@ -66,7 +71,7 @@ def _meta_text(state: str, elapsed_s: float, iteration: int, max_iterations: int
     return "-# " + " · ".join(parts)
 
 
-def _task_texts(tasks: list[dict[str, str]]) -> list[str]:
+def _task_texts(tasks: list[dict[str, str]], state: str) -> list[str]:
     visible = list(tasks[-_TASK_LIMIT:])
     lines = []
     hidden = len(tasks) - len(visible)
@@ -75,6 +80,8 @@ def _task_texts(tasks: list[dict[str, str]]) -> list[str]:
     for task in visible:
         status = str(task.get("status") or "pending").strip().lower()
         marker = _TASK_MARKERS.get(status, "○")
+        if status in {"in_progress", "running"} and state in _TERMINAL_ACTIVE_MARKERS:
+            marker = _TERMINAL_ACTIVE_MARKERS[state]
         title = str(task.get("title") or task.get("id") or "Task").strip()
         lines.append(f"{marker} {title}")
     return lines
@@ -86,7 +93,7 @@ def render_status_card_texts(
 ) -> list[str]:
     texts = [_TERMINAL_TITLES.get(state) or str(title or "Hermes run"), _meta_text(state, elapsed_s, iteration, max_iterations)]
     remaining = _DISPLAY_LIMIT - sum(len(text) for text in texts)
-    for line in _task_texts(tasks):
+    for line in _task_texts(tasks, state):
         if remaining <= 0:
             break
         if len(line) > remaining:
@@ -246,6 +253,7 @@ class CardState:
     terminal_completed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     coalescer: Optional[StatusCardCoalescer] = None
+    refresh_task: Optional[asyncio.Task] = None
 
     def frame(self) -> StatusCardFrame:
         return StatusCardFrame(

@@ -305,11 +305,13 @@ except ImportError:
 
 try:
     from .reaction_controls import (
-        ReactionControlRegistry, add_approval_hint_reactions, handle_raw_reaction_add, resolve_approval_prompt,
+        ReactionControlRegistry, add_approval_hint_reactions, finalize_approval_view,
+        handle_raw_reaction_add, resolve_approval_prompt,
     )
 except ImportError:
     from reaction_controls import (
-        ReactionControlRegistry, add_approval_hint_reactions, handle_raw_reaction_add, resolve_approval_prompt,
+        ReactionControlRegistry, add_approval_hint_reactions, finalize_approval_view,
+        handle_raw_reaction_add, resolve_approval_prompt,
     )
 
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
@@ -1226,6 +1228,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._last_final_messages: OrderedDict[str, str] = OrderedDict()
         self._reaction_registry = ReactionControlRegistry()
         self._status_card_persistence_lock = asyncio.Lock()
+        self._status_card_refresh_interval = 15.0
         from hermes_constants import get_hermes_home
         self._status_card_persistence_path = get_hermes_home() / "state" / "discord_status_cards.json"
 
@@ -4527,6 +4530,41 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self._status_card_keys_by_nonce.pop(card.nonce, None)
         return True
 
+    async def _stop_status_card_refresh(self, card: CardState) -> None:
+        task = card.refresh_task
+        card.refresh_task = None
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _refresh_status_card(self, card: CardState) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._status_card_refresh_interval)
+                async with card.lock:
+                    key = (card.chat_id, card.thread_key)
+                    if (
+                        card.terminal_completed
+                        or card.state not in {"running", "waiting-approval"}
+                        or self._status_cards.get(key) is not card
+                        or card.coalescer is None
+                    ):
+                        return
+                    result = await card.coalescer.submit(card.frame())
+                if not result.success and not result.retryable:
+                    await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    def _start_status_card_refresh(self, card: CardState) -> None:
+        if card.refresh_task is None or card.refresh_task.done():
+            card.refresh_task = asyncio.create_task(self._refresh_status_card(card))
+
     async def _persist_status_cards(self) -> None:
         snapshot = list(self._status_card_persisted.values())
         async with self._status_card_persistence_lock:
@@ -4546,6 +4584,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _disable_status_card_after_permanent_failure(
         self, card: CardState, *, send_fallback: bool,
     ) -> None:
+        await self._stop_status_card_refresh(card)
         if not await self._compare_pop_status_card(card):
             return
         await self._remove_status_card_persistence(card)
@@ -4576,6 +4615,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         async with card.lock:
             if card.terminal_completed:
                 return True
+            await self._stop_status_card_refresh(card)
             if card.coalescer is not None:
                 await card.coalescer.stop(flush=False)
             card.state = outcome
@@ -4740,6 +4780,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "reconcile_attempts": 0,
             }
             await self._persist_status_cards()
+            self._start_status_card_refresh(card)
             return SendResult(success=True, message_id=str(message.id))
         card.tasks = [dict(task) for task in tasks]
         card.title = title or card.title
@@ -4817,6 +4858,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         key = self._status_card_keys_by_nonce.get(run["nonce"])
         card = self._status_cards.get(key) if key is not None else None
         if card is not None and card.generation == run["generation"] and card.session_key == run["session_key"]:
+            await self._stop_status_card_refresh(card)
             if card.coalescer is not None:
                 await card.coalescer.stop(flush=False)
             await self._compare_pop_status_card(card)
@@ -6914,12 +6956,7 @@ def _define_discord_view_classes() -> None:
 
         async def _finalize_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
             """Mark resolved, stamp the embed (color + footer), disable buttons, edit in place."""
-            self.resolved = True
-            embed = self._first_embed(interaction.message)
-            if embed:
-                embed.color = color
-                embed.set_footer(text=footer)
-            self._disable_all()
+            embed = finalize_approval_view(self, interaction.message, color, footer)
             await interaction.response.edit_message(embed=embed, view=self)
 
         def _localize_buttons(self, **keys_by_attr: str) -> None:

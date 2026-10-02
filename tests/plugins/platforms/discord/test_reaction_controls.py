@@ -218,6 +218,8 @@ async def test_role_authorized_reaction_resolves():
         await handle_raw_reaction_add(adapter, _payload(user_id=1234, member=member))
     message.edit.assert_awaited_once()
     assert view.resolved is True
+    assert all(child.disabled for child in view.children)
+    assert message.edit.await_args.kwargs["view"] is view
 
 
 @pytest.mark.asyncio

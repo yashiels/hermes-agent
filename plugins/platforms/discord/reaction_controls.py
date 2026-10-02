@@ -121,6 +121,16 @@ async def resolve_approval_prompt(
     return count
 
 
+def finalize_approval_view(view: Any, message: Any, color: Any, footer: str) -> Any:
+    view.resolved = True
+    embed = message.embeds[0] if getattr(message, "embeds", None) else None
+    if embed is not None:
+        embed.color = color
+        embed.set_footer(text=footer)
+    view._disable_all()
+    return embed
+
+
 async def _reactor_member_role_ids(adapter: Any, payload: Any) -> Optional[set]:
     member = getattr(payload, "member", None)
     if member is not None:
@@ -194,15 +204,7 @@ async def _handle_approval_reaction(adapter: Any, payload: Any, entry: Dict[str,
         message = entry.get("message")
 
         async def _finalize(color: Any, footer: str) -> None:
-            embed = message.embeds[0] if getattr(message, "embeds", None) else None
-            if embed is not None:
-                embed.color = color
-                embed.set_footer(text=footer)
-            if view is not None:
-                view.resolved = True
-                disable_all = getattr(view, "_disable_all", None)
-                if callable(disable_all):
-                    disable_all()
+            embed = finalize_approval_view(view, message, color, footer)
             try:
                 await message.edit(embed=embed, view=view)
             except Exception:

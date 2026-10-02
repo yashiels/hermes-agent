@@ -105,7 +105,7 @@ class AskJarvisModal(discord.ui.Modal):
             label="What should Jarvis do with this message?",
             style=discord.TextStyle.paragraph,
             max_length=1000,
-            required=True,
+            required=False,
         )
         self.add_item(self.instruction)
 
@@ -113,7 +113,8 @@ class AskJarvisModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not await _reject_unauthorized(self._adapter, interaction, ASK_JARVIS_NAME):
             return
-        text = f"{_wrap_untrusted(_format_quoted_message(self._target_message))}\n\n{self.instruction.value}"
+        instruction = str(self.instruction.value or "").strip() or "Respond to this message."
+        text = f"{_wrap_untrusted(_format_quoted_message(self._target_message))}\n\n{instruction}"
         await _dispatch(self._adapter, interaction, text)
 
 

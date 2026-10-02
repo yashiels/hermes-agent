@@ -200,6 +200,27 @@ async def test_ask_jarvis_modal_submit_defers_then_authorizes_then_dispatches():
 
 
 @pytest.mark.asyncio
+async def test_ask_jarvis_modal_allows_empty_instruction_with_default_prompt():
+    captured = {}
+
+    async def _handle_message(event):
+        captured["text"] = event
+
+    adapter = SimpleNamespace(
+        _evaluate_slash_authorization=MagicMock(return_value=(True, None)),
+        _build_slash_event=lambda _interaction, text: text,
+        handle_message=_handle_message,
+    )
+    modal = context_menus.AskJarvisModal(adapter, _msg("Carol", "the quoted message"))
+    modal.instruction.value = ""
+
+    await modal.on_submit(_interaction())
+
+    assert modal.instruction.required is False
+    assert captured["text"].endswith("Respond to this message.")
+
+
+@pytest.mark.asyncio
 async def test_ask_jarvis_modal_submit_sends_error_followup_when_dispatch_fails():
     adapter = SimpleNamespace(
         _evaluate_slash_authorization=MagicMock(return_value=(True, None)),

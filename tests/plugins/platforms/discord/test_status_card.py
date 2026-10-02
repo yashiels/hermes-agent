@@ -297,6 +297,47 @@ async def test_terminal_edit_wins_over_delayed_frame(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_elapsed_refresh_task_is_cancelled_on_terminal(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    adapter._status_card_refresh_interval = 0.01
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    card = next(iter(adapter._status_cards.values()))
+    card.started_at -= 16
+    refresh_task = card.refresh_task
+    await asyncio.sleep(0.03)
+
+    assert any("16s" in text or "17s" in text for text in view_texts(channel.message.edits[-1]["view"]))
+    assert await adapter.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    ) is True
+    assert card.refresh_task is None
+    assert refresh_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_elapsed_refresh_does_not_edit_after_terminal(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    adapter._status_card_refresh_interval = 0.01
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    await asyncio.sleep(0.02)
+    assert await adapter.finalize_native_task_card(
+        "channel-1", outcome="interrupted", reply_to=None, metadata=metadata,
+    ) is True
+    terminal_edit_count = len(channel.message.edits)
+
+    await asyncio.sleep(0.03)
+
+    assert len(channel.message.edits) == terminal_edit_count
+    assert "interrupted" in view_texts(channel.message.edits[-1]["view"])[1]
+
+
+@pytest.mark.asyncio
 async def test_terminal_edit_retries_then_removes_persistence(tmp_path, monkeypatch):
     adapter, channel = make_adapter(tmp_path, monkeypatch)
     metadata = run_metadata()
@@ -675,3 +716,21 @@ def test_terminal_states_replace_the_running_title():
     assert render_status_card_texts(state="failed", **kwargs)[0] == "**Failed**"
     assert render_status_card_texts(state="interrupted", **kwargs)[0] == "**Stopped**"
     assert render_status_card_texts(state="interrupted-restart", **kwargs)[0] == "**Interrupted**"
+
+
+@pytest.mark.parametrize(
+    ("state", "marker"),
+    [("interrupted", "⏹"), ("interrupted-restart", "⏹"), ("failed", "✗")],
+)
+def test_terminal_states_replace_active_markers_without_changing_completed(state, marker):
+    from plugins.platforms.discord.status_card import render_status_card_texts
+    texts = render_status_card_texts(
+        [
+            {"title": "Active", "status": "running"},
+            {"title": "Finished", "status": "completed"},
+        ],
+        title="Hermes run", state=state, elapsed_s=5, iteration=0, max_iterations=0,
+    )
+
+    assert f"{marker} Active" in texts
+    assert "✓ Finished" in texts
