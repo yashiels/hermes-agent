@@ -51,7 +51,7 @@ def _views():
 @pytest.mark.parametrize(
     "name,call",
     [
-        ("exec", lambda v, i: v._resolve(i, "once", None, "x")),
+        ("exec", lambda v, i: v._resolve(i, "once")),
         ("slash", lambda v, i: v._resolve(i, "once", None, "x")),
         ("update", lambda v, i: v._respond(i, "y", None, "x")),
         ("clarify", lambda v, i: v._resolve_choice(i, 0, "a")),
