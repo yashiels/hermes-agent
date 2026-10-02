@@ -4453,6 +4453,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def reaction_controls_enabled(self) -> bool:
         return self._extra_flag("reaction_controls")
 
+    def _context_menus_enabled(self) -> bool:
+        return self._extra_flag("context_menus")
+
     def set_gateway_controls(self, controls: Any) -> None:
         self._gateway_controls = controls
 
@@ -4998,10 +5001,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
             )
+        context_menu_count = 0
+        if self._context_menus_enabled():
+            from plugins.platforms.discord.context_menus import message_context_menu_count
+            context_menu_count = message_context_menu_count()
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.
         already_registered: set[str] = set()
-        slot_cap = _DISCORD_MAX_APP_COMMANDS - 1
+        slot_cap = _DISCORD_MAX_APP_COMMANDS - 1 - context_menu_count
         dropped_over_cap = 0
 
         def _auto_register(name: str, description: str, args_hint: str) -> None:
@@ -5051,6 +5058,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except Exception as e:
             logger.warning("Discord auto-register from plugin commands failed: %s", e)
         self._register_skill_group(tree)
+        if context_menu_count:
+            self._register_discord_context_menus(tree)
         if dropped_over_cap:
             # One over-limit command makes Discord reject the entire sync (error 30032).
             logger.warning(
@@ -5067,6 +5076,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             "true", "1", "yes", "on",
         }:
             self._apply_owner_only_visibility(tree)
+
+    def _register_discord_context_menus(self, tree) -> None:
+        from plugins.platforms.discord.context_menus import register_context_menus
+        try:
+            registered = register_context_menus(self, tree)
+        except Exception as e:
+            logger.warning("[%s] Failed to register Discord context menus: %s", self.name, e)
+            return
+        logger.info("[%s] Registered %d Discord message context menu(s)", self.name, registered)
 
     def _apply_owner_only_visibility(self, tree) -> None:
         """Set default_member_permissions=0 on every registered slash command.
