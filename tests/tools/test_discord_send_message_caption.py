@@ -127,7 +127,10 @@ def test_no_caption_non_forum_keeps_separate_text():
         assert res["success"] is True
         # Two POSTs: the text content message, then the media upload.
         assert len(calls) == 2
-        assert calls[0][1] == {"content": "hello"}
+        assert calls[0][1] == {
+            "content": "hello",
+            "allowed_mentions": {"parse": ["users"], "replied_user": True},
+        }
         assert calls[1][0].endswith("/messages")
     finally:
         os.unlink(img)

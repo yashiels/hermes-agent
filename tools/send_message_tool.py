@@ -699,6 +699,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         return await _send_telegram(
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
+    if platform_name == "discord":
+        from plugins.platforms.discord.render import format_discord_message
+        message = format_discord_message(message)
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]

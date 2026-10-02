@@ -1,5 +1,7 @@
 import re
 
+from gateway.platforms.helpers import convert_table_to_bullets
+
 _HORIZONTAL_RULE_RE = re.compile(r'^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$')
 _DEEP_HEADER_RE = re.compile(r'^(\s{0,3})#{4,}(\s+.*)$')
 
@@ -20,3 +22,9 @@ def render_for_discord(text: str) -> str:
         header_match = _DEEP_HEADER_RE.match(line)
         out.append(f"{header_match.group(1)}###{header_match.group(2)}" if header_match else line)
     return '\n'.join(out)
+
+
+def format_discord_message(content: str) -> str:
+    if not content:
+        return content
+    return render_for_discord(convert_table_to_bullets(content))
