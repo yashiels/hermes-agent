@@ -298,10 +298,15 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
+try:
+    from .render import format_discord_message
+except ImportError:
+    from render import format_discord_message
+
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
-    MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets, is_discord_channel_obfuscated,
+    MessageDeduplicator, ThreadParticipationTracker, is_discord_channel_obfuscated,
 )
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
@@ -4372,10 +4377,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
     def format_message(self, content: str) -> str:
-        """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
-        if not content:
-            return content
-        return convert_table_to_bullets(content)
+        return format_discord_message(content)
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
@@ -7048,6 +7050,13 @@ async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_k
     return is_forum
 
 
+def _standalone_allowed_mentions_payload(pconfig) -> dict:
+    allowed_mentions = _build_allowed_mentions(getattr(pconfig, "extra", None))
+    if allowed_mentions is not None:
+        return allowed_mentions.to_dict()
+    return {"parse": ["users"], "replied_user": True}
+
+
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
     media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None,
@@ -7073,6 +7082,7 @@ async def _standalone_send(
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         auth_headers = {"Authorization": f"Bot {token}"}
         json_headers = {**auth_headers, "Content-Type": "application/json"}
+        mentions = _standalone_allowed_mentions_payload(pconfig)
         media_files = media_files or []
         last_data = None
         warnings = []
@@ -7097,7 +7107,10 @@ async def _standalone_send(
                             {"id": str(idx), "filename": os.path.basename(path)}
                             for idx, path in enumerate(valid_media)
                         ]
-                        starter_message = {"content": (caption or message), "attachments": attachments_meta}
+                        starter_message = {
+                            "content": (caption or message), "attachments": attachments_meta,
+                            "allowed_mentions": mentions,
+                        }
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
                         form = aiohttp.FormData()
                         form.add_field("payload_json", payload_json, content_type="application/json")
@@ -7118,7 +7131,10 @@ async def _standalone_send(
                         # No media: JSON POST creates the thread with the text starter.
                         async with session.post(
                             thread_url, headers=json_headers,
-                            json={"name": thread_name, "message": {"content": message}}, **_req_kw,
+                            json={
+                                "name": thread_name,
+                                "message": {"content": message, "allowed_mentions": mentions},
+                            }, **_req_kw,
                         ) as resp:
                             data, err = await _standalone_response_json_or_error(resp, "Discord forum thread creation error")
                             if err:
@@ -7135,7 +7151,10 @@ async def _standalone_send(
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                async with session.post(
+                    url, headers=json_headers,
+                    json={"content": message, "allowed_mentions": mentions}, **_req_kw,
+                ) as resp:
                     last_data, err = await _standalone_response_json_or_error(resp, "Discord API error")
                     if err:
                         return err
@@ -7148,7 +7167,8 @@ async def _standalone_send(
                     if caption_pending:
                         try:
                             async with session.post(
-                                url, headers=json_headers, json={"content": caption}, **_req_kw,
+                                url, headers=json_headers,
+                                json={"content": caption, "allowed_mentions": mentions}, **_req_kw,
                             ) as resp:
                                 if resp.status in {200, 201}:
                                     last_data = await _standalone_read_json_limited(
@@ -7163,7 +7183,7 @@ async def _standalone_send(
                     filename = os.path.basename(media_path)
                     if caption_pending:
                         form.add_field(
-                            "payload_json", json.dumps({"content": caption}),
+                            "payload_json", json.dumps({"content": caption, "allowed_mentions": mentions}),
                             content_type="application/json",
                         )
                         caption_pending = False
