@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -323,6 +323,31 @@ from gateway.platforms._shared import (
     extra_or_secret as _extra_or_secret, platform_gate_env as _scoped_gate_env, send_error,
     yaml_env_setter as _yaml_env_setter
 )
+
+CardState = StatusCardCoalescer = StatusCardFrame = StatusCardView = StopCardButton = None
+
+
+def _load_discord_status_card_types() -> None:
+    global CardState, StatusCardCoalescer, StatusCardFrame, StatusCardView, StopCardButton
+    from plugins.platforms.discord.status_card import (
+        CardState as _CardState,
+        StatusCardCoalescer as _StatusCardCoalescer,
+        StatusCardFrame as _StatusCardFrame,
+        StatusCardView as _StatusCardView,
+        StopCardButton as _StopCardButton,
+    )
+    CardState = _CardState
+    StatusCardCoalescer = _StatusCardCoalescer
+    StatusCardFrame = _StatusCardFrame
+    StatusCardView = _StatusCardView
+    StopCardButton = _StopCardButton
+
+
+if DISCORD_AVAILABLE and all(
+    hasattr(discord.ui, name)
+    for name in ("ActionRow", "Container", "DynamicItem", "LayoutView", "Separator", "TextDisplay")
+):
+    _load_discord_status_card_types()
 
 
 
@@ -656,6 +681,11 @@ def check_discord_requirements() -> bool:
     Intents = _Intents
     commands = _commands
     DISCORD_AVAILABLE = True
+    if all(
+        hasattr(discord.ui, name)
+        for name in ("ActionRow", "Container", "DynamicItem", "LayoutView", "Separator", "TextDisplay")
+    ):
+        _load_discord_status_card_types()
     _define_discord_view_classes()
     return True
 
@@ -1177,6 +1207,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        self._gateway_controls = None
+        self._gateway_controls_warning_emitted = False
+        self._status_cards: Dict[Tuple[str, str], CardState] = {}
+        self._status_card_keys_by_nonce: Dict[str, Tuple[str, str]] = {}
+        self._status_card_persisted: Dict[str, Dict[str, Any]] = {}
+        self._status_message_ids: Dict[Tuple[str, str, int, str], str] = {}
+        self._ended_status_runs: OrderedDict[Tuple[str, int], None] = OrderedDict()
+        self._last_final_messages: OrderedDict[str, str] = OrderedDict()
+        self._status_card_persistence_lock = asyncio.Lock()
+        from hermes_constants import get_hermes_home
+        self._status_card_persistence_path = get_hermes_home() / "state" / "discord_status_cards.json"
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -1329,6 +1370,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 allowed_mentions=_build_allowed_mentions(getattr(self.config, "extra", None)),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._client._hermes_discord_adapter = self
+            if StopCardButton is not None and callable(getattr(self._client, "add_dynamic_items", None)):
+                self._client.add_dynamic_items(StopCardButton)
             # Fresh connection, fresh dispatch-side silence window: the previous client's last
             # DISPATCH stamp must not leak into this connection's liveness samples (#109521).
             # READY itself is a DISPATCH event, so a healthy connection stamps almost immediately.
@@ -2169,6 +2213,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not self._client:
             return
         try:
+            if self.native_task_cards_enabled():
+                await self._reconcile_status_cards()
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
@@ -4372,6 +4418,371 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Format for Discord: tables become bullet lists, rules are dropped, headers collapse to h3."""
         return format_discord_message(content)
 
+    def native_task_cards_enabled(self) -> bool:
+        value = (self.config.extra or {}).get("native_task_cards", False)
+        return value if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def set_gateway_controls(self, controls: Any) -> None:
+        self._gateway_controls = controls
+
+    @staticmethod
+    def _hermes_run(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        run = (metadata or {}).get("hermes_run")
+        if not isinstance(run, dict):
+            return None
+        if not run.get("session_key") or not run.get("nonce"):
+            return None
+        try:
+            generation = int(run.get("generation"))
+        except (TypeError, ValueError):
+            return None
+        return {
+            "session_key": str(run["session_key"]),
+            "generation": generation,
+            "nonce": str(run["nonce"]),
+        }
+
+    @staticmethod
+    def _status_card_key(chat_id: str, metadata: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+        thread_key = str((metadata or {}).get("thread_id") or "")
+        return str(chat_id), thread_key
+
+    @staticmethod
+    def _status_card_channel_id(chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
+        return str((metadata or {}).get("thread_id") or chat_id)
+
+    @staticmethod
+    def _status_card_error_result(exc: BaseException) -> SendResult:
+        code = getattr(exc, "code", None)
+        status = getattr(exc, "status", None)
+        response = getattr(exc, "response", None)
+        if status is None and response is not None:
+            status = getattr(response, "status", None) or getattr(response, "status_code", None)
+        try:
+            code = int(code)
+        except (TypeError, ValueError):
+            code = None
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+        permanent = code == 50035 or status in {400, 403, 404}
+        transient = status is not None and 500 <= status < 600
+        return SendResult(
+            success=False, error=str(exc), raw_response=exc,
+            retryable=bool(transient and not permanent),
+        )
+
+    async def _edit_status_card_frame(self, card: CardState, frame: StatusCardFrame) -> SendResult:
+        try:
+            view = StatusCardView(
+                frame.tasks, nonce=card.nonce, title=frame.title, state=frame.state,
+                elapsed_s=frame.elapsed_s, iteration=frame.iteration,
+                max_iterations=frame.max_iterations,
+            )
+            await card.message.edit(view=view)
+            return SendResult(success=True, message_id=str(card.message.id))
+        except Exception as exc:
+            result = self._status_card_error_result(exc)
+            if not result.retryable:
+                await self._compare_pop_status_card(card)
+            return result
+
+    async def _compare_pop_status_card(self, card: CardState) -> bool:
+        key = (card.chat_id, card.thread_key)
+        if self._status_cards.get(key) is not card:
+            return False
+        self._status_cards.pop(key, None)
+        if self._status_card_keys_by_nonce.get(card.nonce) == key:
+            self._status_card_keys_by_nonce.pop(card.nonce, None)
+        return True
+
+    async def _persist_status_cards(self) -> None:
+        snapshot = list(self._status_card_persisted.values())
+        async with self._status_card_persistence_lock:
+            path = self._status_card_persistence_path
+            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(atomic_json_write, path, snapshot, indent=None)
+
+    def _read_status_card_entries(self) -> list[dict[str, Any]]:
+        try:
+            data = json.loads(self._status_card_persistence_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return []
+        return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+    async def _reconcile_status_cards(self) -> None:
+        entries = await asyncio.to_thread(self._read_status_card_entries)
+        self._status_card_persisted.update({
+            str(entry.get("nonce")): dict(entry)
+            for entry in entries
+            if entry.get("nonce")
+        })
+        for entry in entries:
+            channel_id = str(entry.get("channel_id") or "")
+            message_id = str(entry.get("message_id") or "")
+            if not channel_id or not message_id:
+                continue
+            for attempt in range(3):
+                try:
+                    channel = await self._resolve_channel(channel_id)
+                    if channel is None:
+                        raise RuntimeError(f"Channel {channel_id} not found")
+                    message = channel.get_partial_message(int(message_id))
+                    view = StatusCardView(
+                        [], nonce=None, title="Hermes run", state="interrupted-restart",
+                        elapsed_s=max(0.0, time.time() - float(entry.get("started_at") or time.time())),
+                        iteration=0, max_iterations=0,
+                    )
+                    await message.edit(view=view)
+                    break
+                except Exception as exc:
+                    if attempt < 2:
+                        await asyncio.sleep(0.25 * (2 ** attempt))
+                    else:
+                        logger.warning(
+                            "[Discord] Failed to reconcile status card %s/%s after 3 attempts: %s",
+                            channel_id, message_id, exc,
+                        )
+            self._status_card_persisted.pop(str(entry.get("nonce") or ""), None)
+        await self._persist_status_cards()
+
+    def native_task_card_destination_supported(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        return self._hermes_run(metadata) is not None
+
+    async def send_native_task_card_progress(
+        self, chat_id: str, tasks: List[Dict[str, str]], *, title: Optional[str] = None,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+        fallback_text: Optional[str] = None,
+    ) -> SendResult:
+        if not self.native_task_cards_enabled():
+            return SendResult(success=False, error="Discord native task cards disabled")
+        run = self._hermes_run(metadata)
+        if run is None or not tasks:
+            return SendResult(success=False, error="Missing Discord status-card run or tasks")
+        key = self._status_card_key(chat_id, metadata)
+        card = self._status_cards.get(key)
+        if card is not None and card.nonce != run["nonce"]:
+            if card.coalescer is not None:
+                await card.coalescer.stop(flush=False)
+            await self._compare_pop_status_card(card)
+            card = None
+        if card is None:
+            try:
+                channel_id = self._status_card_channel_id(chat_id, metadata)
+                channel = await self._resolve_channel(channel_id)
+                if channel is None:
+                    return SendResult(success=False, error=f"Channel {channel_id} not found")
+                view = StatusCardView(
+                    tasks, nonce=run["nonce"], title=title or "Hermes run", state="running",
+                    elapsed_s=0.0, iteration=0, max_iterations=0,
+                )
+                message = await channel.send(view=view)
+            except Exception as exc:
+                return self._status_card_error_result(exc)
+            card = CardState(
+                nonce=run["nonce"], generation=run["generation"],
+                session_key=run["session_key"], chat_id=key[0], thread_key=key[1],
+                channel_id=channel_id, message=message, tasks=[dict(task) for task in tasks],
+                state="running", started_at=time.time(), title=title or "Hermes run",
+            )
+            card.coalescer = StatusCardCoalescer(lambda frame: self._edit_status_card_frame(card, frame))
+            self._status_cards[key] = card
+            self._status_card_keys_by_nonce[card.nonce] = key
+            self._status_card_persisted[card.nonce] = {
+                "channel_id": card.channel_id,
+                "message_id": str(card.message.id),
+                "nonce": card.nonce,
+                "started_at": card.started_at,
+            }
+            await self._persist_status_cards()
+            return SendResult(success=True, message_id=str(message.id))
+        card.tasks = [dict(task) for task in tasks]
+        card.title = title or card.title
+        if card.state != "waiting-approval":
+            card.state = "running"
+        return await card.coalescer.submit(card.frame())
+
+    async def stop_native_task_card_progress(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        run = self._hermes_run(metadata)
+        if run is None:
+            return
+        key = self._status_card_keys_by_nonce.get(run["nonce"])
+        card = self._status_cards.get(key) if key is not None else None
+        if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
+            return
+        if card.coalescer is not None:
+            await card.coalescer.stop(flush=True)
+
+    async def update_native_task_card_activity(
+        self, chat_id: str, *, elapsed_s: float, iteration: int, max_iterations: int,
+        reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        run = self._hermes_run(metadata)
+        if run is None:
+            return False
+        key = self._status_card_keys_by_nonce.get(run["nonce"])
+        card = self._status_cards.get(key) if key is not None else None
+        if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
+            return False
+        card.elapsed_s = max(0.0, float(elapsed_s))
+        card.iteration = max(0, int(iteration))
+        card.max_iterations = max(0, int(max_iterations))
+        result = await card.coalescer.submit(card.frame())
+        return bool(result.success)
+
+    async def finalize_native_task_card(
+        self, chat_id: str, *, outcome: str, reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        run = self._hermes_run(metadata)
+        if run is None:
+            return False
+        key = self._status_card_keys_by_nonce.get(run["nonce"])
+        card = self._status_cards.get(key) if key is not None else None
+        if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
+            return False
+        terminal_succeeded = False
+        async with card.lock:
+            if card.coalescer is not None:
+                await card.coalescer.stop(flush=False)
+            card.state = outcome
+            card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
+            frame = card.frame()
+            for attempt in range(3):
+                result = await self._edit_status_card_frame(card, frame)
+                if result.success:
+                    terminal_succeeded = True
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (2 ** attempt))
+            if not terminal_succeeded:
+                try:
+                    await card.message.edit(view=None)
+                except Exception:
+                    pass
+                notice_metadata = dict(metadata or {})
+                if card.thread_key:
+                    notice_metadata["thread_id"] = card.thread_key
+                await self.send(
+                    chat_id, f"-# run {outcome} · status card could not be updated",
+                    metadata=notice_metadata,
+                )
+            await self._compare_pop_status_card(card)
+        if terminal_succeeded:
+            self._status_card_persisted.pop(card.nonce, None)
+            await self._persist_status_cards()
+        return terminal_succeeded
+
+    async def on_turn_end(
+        self, chat_id: str, *, metadata: Optional[Dict[str, Any]], outcome: str,
+    ) -> None:
+        run = self._hermes_run(metadata)
+        if run is None:
+            return
+        ended_key = (run["session_key"], run["generation"])
+        self._ended_status_runs[ended_key] = None
+        self._ended_status_runs.move_to_end(ended_key)
+        while len(self._ended_status_runs) > 200:
+            self._ended_status_runs.popitem(last=False)
+        card_key = self._status_card_key(chat_id, metadata)
+        for status_key in list(self._status_message_ids):
+            if status_key[:3] == (card_key[0], card_key[1], run["generation"]):
+                self._status_message_ids.pop(status_key, None)
+        key = self._status_card_keys_by_nonce.get(run["nonce"])
+        card = self._status_cards.get(key) if key is not None else None
+        if card is not None and card.generation == run["generation"] and card.session_key == run["session_key"]:
+            if card.coalescer is not None:
+                await card.coalescer.stop(flush=False)
+            await self._compare_pop_status_card(card)
+
+    async def _set_status_card_approval(
+        self, metadata: Optional[Dict[str, Any]], waiting: bool,
+    ) -> None:
+        run = self._hermes_run(metadata)
+        if run is None:
+            return
+        key = self._status_card_keys_by_nonce.get(run["nonce"])
+        card = self._status_cards.get(key) if key is not None else None
+        if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
+            return
+        card.state = "waiting-approval" if waiting else "running"
+        await card.coalescer.submit(card.frame())
+
+    async def send_or_update_status(
+        self, chat_id: str, status_key: str, content: str, *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self.native_task_cards_enabled():
+            return await self.send(chat_id, content, metadata=metadata)
+        run = self._hermes_run(metadata)
+        if run is None:
+            return await self.send(chat_id, content, metadata=metadata)
+        if (run["session_key"], run["generation"]) in self._ended_status_runs:
+            return SendResult(success=False, error="Discord status run already ended")
+        thread_key = str((metadata or {}).get("thread_id") or "")
+        key = (str(chat_id), thread_key, run["generation"], str(status_key))
+        cached_id = self._status_message_ids.get(key)
+        if cached_id is not None:
+            result = await self.edit_message(
+                self._status_card_channel_id(chat_id, metadata), cached_id, content,
+                finalize=False, metadata=metadata,
+            )
+            if result.success:
+                return result
+            self._status_message_ids.pop(key, None)
+        result = await self.send(chat_id, content, metadata=metadata)
+        if result.success and result.message_id:
+            self._status_message_ids[key] = str(result.message_id)
+        return result
+
+    async def on_final_message(
+        self, chat_id: str, message_id: str, *, metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        run = self._hermes_run(metadata)
+        if run is None:
+            return
+        self._last_final_messages[run["session_key"]] = str(message_id)
+        self._last_final_messages.move_to_end(run["session_key"])
+        while len(self._last_final_messages) > 200:
+            self._last_final_messages.popitem(last=False)
+
+    async def handle_status_card_stop(self, interaction: Any, nonce: str) -> None:
+        key = self._status_card_keys_by_nonce.get(nonce)
+        card = self._status_cards.get(key) if key is not None else None
+        if card is None or card.nonce != nonce:
+            await interaction.followup.send("nothing running", ephemeral=True)
+            return
+        user = getattr(interaction, "user", None)
+        roles = getattr(user, "roles", None)
+        try:
+            member_role_ids = None if roles is None else {getattr(role, "id", None) for role in roles}
+        except TypeError:
+            member_role_ids = None
+        authorized = _discord_principal_authorized(
+            getattr(user, "id", None), member_role_ids,
+            allowed_user_ids=self._allowed_user_ids, allowed_role_ids=self._allowed_role_ids,
+            require_admin=False, admin_user_ids=None,
+        )
+        if not authorized:
+            await interaction.followup.send(_unauthorized(), ephemeral=True)
+            return
+        controls = self._gateway_controls
+        if controls is None:
+            if not self._gateway_controls_warning_emitted:
+                logger.warning("[Discord] Status-card controls are unavailable; gateway controls were not injected")
+                self._gateway_controls_warning_emitted = True
+            await interaction.followup.send("nothing running", ephemeral=True)
+            return
+        stopped = await controls.stop_if_current(card.session_key, card.generation)
+        await interaction.followup.send("stopping" if stopped else "nothing running", ephemeral=True)
+
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
         so the caller still runs the command but skips followups. Other errors propagate."""
@@ -5567,6 +5978,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Send an approval with content as its canonical payload and an embed for state."""
+        await self._set_status_card_approval(prompt.metadata, True)
+
+        async def _restore_running() -> None:
+            await self._set_status_card_approval(prompt.metadata, False)
+
         def _build(_channel):
             content = prompt.text
             mention_content = self._approval_mention_content()
@@ -5583,6 +5999,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 allowed_role_ids=self._allowed_role_ids, require_admin=require_admin,
                 admin_user_ids=admin_user_ids, allow_permanent="always" in choices,
                 allow_session="session" in choices, smart_denied=prompt.smart_denied,
+                approval_state_callback=_restore_running,
             )
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
             if mention_content:
@@ -5592,7 +6009,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         users=True, roles=False, everyone=False, replied_user=False,
                     )
             return send_kwargs, view
-        return await self._send_prompt(prompt.chat_id, prompt.metadata, _build)
+        result = await self._send_prompt(prompt.chat_id, prompt.metadata, _build)
+        if not result.success:
+            await _restore_running()
+        return result
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
@@ -6212,63 +6632,60 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 
-def _component_check_auth(
-    interaction, allowed_user_ids: Optional[set], allowed_role_ids: Optional[set],
+def _discord_principal_authorized(
+    user_id: Any, member_role_ids: Optional[set], *, allowed_user_ids: Optional[set],
+    allowed_role_ids: Optional[set], require_admin: bool, admin_user_ids: Optional[set],
 ) -> bool:
-    """Shared user-or-role OR authorization for component button clicks.
-    Allow on: DISCORD/GATEWAY_ALLOW_ALL_USERS, user in DISCORD/GATEWAY_ALLOWED_USERS, a role in the
-    role allowlist, or pairing-store approval. Role allowlist with no ``roles`` (DM) rejects (fail closed).
-    """
-    user = getattr(interaction, "user", None)
-    if user is None or getattr(user, "id", None) is None:
+    uid = str(user_id or "").strip()
+    if not uid:
         return False
-    # Scope-aware reads: interaction tasks inherit the owning profile's secret-scope contextvar;
-    # under multiplex a raw os.getenv could return ANOTHER profile's allow-all flag.
-    # Scope-aware reads (issue #72348): component interactions are dispatched from discord.py tasks
-    # descended from the task created inside the owning profile's runtime scope, so the profile's
-    # secret-scope contextvar is inherited here.
     if _scoped_gate_env("DISCORD_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:
-        return True
-    if _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:
-        return True
+        admitted = True
+    elif _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:
+        admitted = True
+    else:
+        admitted = False
     user_set = {str(uid).strip() for uid in (allowed_user_ids or set()) if str(uid).strip()}
-    global_allowed = {
-        uid.strip()
-        for uid in _scoped_gate_env("GATEWAY_ALLOWED_USERS").split(",")
-        if uid.strip()
-    }
+    global_allowed = {value.strip() for value in _scoped_gate_env("GATEWAY_ALLOWED_USERS").split(",") if value.strip()}
     user_set.update(global_allowed)
-    role_set = set(allowed_role_ids or set())
-    has_users = bool(user_set)
-    has_roles = bool(role_set)
-    try:
-        uid = str(user.id)
-    except AttributeError:
-        uid = ""
-    if has_users:
-        if "*" in user_set or (uid and uid in user_set):
-            return True
-    if has_roles:
-        roles_attr = getattr(user, "roles", None)
-        if roles_attr is None:
-            # Role policy configured but no role data (DM Member, raw User): fail closed.
-            return False
-        try:
-            user_role_ids = {getattr(r, "id", None) for r in roles_attr}
-        except TypeError:
-            return False
-        if user_role_ids & role_set:
-            return True
-    # Pairing store (mirrors ``authz_mixin._check_authorization``): paired users click without allowlist.
-    if uid:
+    if "*" in user_set or uid in user_set:
+        admitted = True
+    role_set = {str(role).strip() for role in (allowed_role_ids or set()) if str(role).strip()}
+    if role_set and member_role_ids is not None:
+        principal_roles = {str(role).strip() for role in member_role_ids if str(role).strip()}
+        admitted = admitted or bool(principal_roles & role_set)
+    if not admitted:
         try:
             from gateway.pairing import PairingStore
             store = PairingStore()
             if store.is_approved("discord", uid):
-                return True
+                admitted = True
         except Exception:
             pass
-    return False
+    if not admitted:
+        return False
+    if not require_admin:
+        return True
+    admins = {str(admin).strip() for admin in (admin_user_ids or set()) if str(admin).strip()}
+    return bool(admins and uid in admins)
+
+
+def _component_check_auth(
+    interaction, allowed_user_ids: Optional[set], allowed_role_ids: Optional[set],
+) -> bool:
+    user = getattr(interaction, "user", None)
+    if user is None or getattr(user, "id", None) is None:
+        return False
+    roles = getattr(user, "roles", None)
+    try:
+        member_role_ids = None if roles is None else {getattr(role, "id", None) for role in roles}
+    except TypeError:
+        member_role_ids = None
+    return _discord_principal_authorized(
+        getattr(user, "id", None), member_role_ids,
+        allowed_user_ids=allowed_user_ids, allowed_role_ids=allowed_role_ids,
+        require_admin=False, admin_user_ids=None,
+    )
 
 
 def _resolve_exec_approval_admin_gate(config_extra: Optional[dict]) -> Tuple[bool, set]:
@@ -6378,11 +6795,13 @@ def _define_discord_view_classes() -> None:
             self, session_key: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
             require_admin: bool = False, admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True, allow_session: bool = True, smart_denied: bool = False,
+            approval_state_callback: Optional[Callable] = None,
         ):
             super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
             self.require_admin = require_admin
             self.admin_user_ids = {str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()}
+            self.approval_state_callback = approval_state_callback
             self._localize_buttons(
                 allow_once="gateway.exec_approval.action_once", allow_session="gateway.exec_approval.action_session",
                 allow_always="gateway.exec_approval.action_always", deny="gateway.exec_approval.action_deny")
@@ -6393,20 +6812,18 @@ def _define_discord_view_classes() -> None:
                 self.remove_item(self.allow_always)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
-            """Base admission always required; with ``require_admin`` the clicker must
-            also be an admin. Fails closed (logged once) when no admins are configured."""
-            if not super()._check_auth(interaction):
-                return False
-            if not self.require_admin:
-                return True
             user = getattr(interaction, "user", None)
             try:
-                uid = str(getattr(user, "id", "") or "")
+                roles = getattr(user, "roles", None)
+                member_role_ids = None if roles is None else {getattr(role, "id", None) for role in roles}
             except Exception:
-                uid = ""
-            if uid and uid in self.admin_user_ids:
-                return True
-            if not self.admin_user_ids:
+                member_role_ids = None
+            authorized = _discord_principal_authorized(
+                getattr(user, "id", None), member_role_ids,
+                allowed_user_ids=self.allowed_user_ids, allowed_role_ids=self.allowed_role_ids,
+                require_admin=self.require_admin, admin_user_ids=self.admin_user_ids,
+            )
+            if self.require_admin and not self.admin_user_ids:
                 logger.warning(
                     "[Discord] require_admin_for_exec_approval is enabled but "
                     "no admins are configured (allow_admin_from is empty) — "
@@ -6414,7 +6831,7 @@ def _define_discord_view_classes() -> None:
                     "admin user IDs under the discord platform's "
                     "allow_admin_from, or disable the toggle."
                 )
-            return False
+            return authorized
 
         async def _resolve(self, interaction: discord.Interaction, choice: str, color: discord.Color, label_key: str):
             """Resolve the approval via the gateway approval queue and update the embed."""
@@ -6440,9 +6857,20 @@ def _define_discord_view_classes() -> None:
             if not count:
                 color = discord.Color.dark_grey()
                 label = t("platform.discord.approval.expired")
-            await self._finalize_embed(
-                interaction, color,
-                t("platform.discord.approval.by_user", label=label, user=interaction.user.display_name) if count else label)
+            try:
+                await self._finalize_embed(
+                    interaction, color,
+                    t("platform.discord.approval.by_user", label=label, user=interaction.user.display_name) if count else label)
+            finally:
+                if self.approval_state_callback is not None:
+                    await self.approval_state_callback()
+
+        async def on_timeout(self):
+            try:
+                await super().on_timeout()
+            finally:
+                if self.approval_state_callback is not None:
+                    await self.approval_state_callback()
 
         # Decorator labels are placeholders; ``_localize_buttons`` in __init__ sets the real text.
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)

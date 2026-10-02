@@ -4344,8 +4344,50 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
+        if result.success and result.message_id and self.gateway_runner is not None:
+            await self.gateway_runner._record_final_message(
+                delivery_adapter, event.source.chat_id, str(result.message_id),
+                session_key=session_key, metadata=metadata,
+            )
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+
+    async def _run_gateway_turn_end_hooks(
+        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
+        metadata: Optional[Dict[str, Any]], delivery_attempted: bool, delivery_succeeded: bool,
+    ) -> None:
+        hermes_run = getattr(event, "_hermes_run", None)
+        if not isinstance(hermes_run, dict):
+            return
+        hook_metadata = dict(metadata or {})
+        hook_metadata["hermes_run"] = dict(hermes_run)
+        preliminary = getattr(event, "_hermes_turn_outcome", "failed")
+        outcome = (
+            "interrupted"
+            if interrupt_event.is_set() or preliminary == "interrupted"
+            else "failed"
+            if preliminary == "failed" or (delivery_attempted and not delivery_succeeded)
+            else "done"
+        )
+        finalize = getattr(self, "finalize_native_task_card", None)
+        if callable(finalize):
+            try:
+                result = finalize(
+                    event.source.chat_id, outcome=outcome,
+                    reply_to=_reply_anchor_for_event(event), metadata=hook_metadata,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("[%s] Native task-card finalization failed", self.name, exc_info=True)
+        turn_end = getattr(self, "on_turn_end", None)
+        if callable(turn_end):
+            try:
+                result = turn_end(event.source.chat_id, metadata=hook_metadata, outcome=outcome)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("[%s] Turn-end hook failed", self.name, exc_info=True)
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4501,11 +4543,18 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
+        if isinstance(getattr(event, "_hermes_run", None), dict):
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["hermes_run"] = dict(event._hermes_run)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        response = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            if isinstance(getattr(event, "_hermes_run", None), dict):
+                _thread_metadata = dict(_thread_metadata or {})
+                _thread_metadata["hermes_run"] = dict(event._hermes_run)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4593,6 +4642,7 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            event._hermes_turn_outcome = "failed"
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4605,6 +4655,10 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+            await self._run_gateway_turn_end_hooks(
+                event, session_key, interrupt_event, _thread_metadata,
+                delivery_attempted, delivery_succeeded,
+            )
             await self._fire_post_delivery_callback(session_key, interrupt_event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(

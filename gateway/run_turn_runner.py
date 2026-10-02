@@ -533,7 +533,7 @@ class TurnRunner:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.debug("task-card stop failed during turn cleanup", exc_info=True)
+                    logger.warning("task-card stop failed during turn cleanup", exc_info=True)
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 

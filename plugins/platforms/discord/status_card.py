@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Optional
+
+import discord
+
+from gateway.platforms.base import SendResult
+
+
+_DISPLAY_LIMIT = 3800
+_TASK_LIMIT = 8
+_STATE_LABELS = {
+    "running": "running",
+    "waiting-approval": "waiting for approval",
+    "done": "done",
+    "failed": "failed",
+    "interrupted": "interrupted",
+    "interrupted-restart": "interrupted (gateway restarted)",
+}
+_STATE_COLOURS = {
+    "running": 0x5865F2,
+    "waiting-approval": 0xF0B232,
+    "done": 0x57F287,
+    "failed": 0xED4245,
+    "interrupted": 0x747F8D,
+    "interrupted-restart": 0x747F8D,
+}
+_TASK_MARKERS = {
+    "pending": "○",
+    "in_progress": "◐",
+    "running": "◐",
+    "completed": "✓",
+    "done": "✓",
+    "failed": "✗",
+    "error": "✗",
+}
+
+
+def _elapsed_text(elapsed_s: float) -> str:
+    seconds = max(0, int(elapsed_s))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _meta_text(state: str, elapsed_s: float, iteration: int, max_iterations: int) -> str:
+    parts = [_STATE_LABELS.get(state, state.replace("-", " ")), _elapsed_text(elapsed_s)]
+    if max_iterations > 0:
+        parts.append(f"iteration {max(0, int(iteration))}/{int(max_iterations)}")
+    elif iteration > 0:
+        parts.append(f"iteration {int(iteration)}")
+    return "-# " + " · ".join(parts)
+
+
+def _task_texts(tasks: list[dict[str, str]]) -> list[str]:
+    visible = list(tasks[-_TASK_LIMIT:])
+    lines = []
+    hidden = len(tasks) - len(visible)
+    if hidden > 0:
+        lines.append(f"-# +{hidden} earlier")
+    for task in visible:
+        status = str(task.get("status") or "pending").strip().lower()
+        marker = _TASK_MARKERS.get(status, "○")
+        title = str(task.get("title") or task.get("id") or "Task").strip()
+        lines.append(f"{marker} {title}")
+    return lines
+
+
+def render_status_card_texts(
+    tasks: list[dict[str, str]], *, title: str, state: str, elapsed_s: float,
+    iteration: int, max_iterations: int,
+) -> list[str]:
+    texts = [str(title or "Hermes run"), _meta_text(state, elapsed_s, iteration, max_iterations)]
+    remaining = _DISPLAY_LIMIT - sum(len(text) for text in texts)
+    for line in _task_texts(tasks):
+        if remaining <= 0:
+            break
+        if len(line) > remaining:
+            line = line[: max(0, remaining - 1)] + ("…" if remaining else "")
+        texts.append(line)
+        remaining -= len(line)
+    return texts
+
+
+class StopCardButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"hermes:card:stop:(?P<nonce>[0-9a-f]{16})",
+):
+    def __init__(self, nonce: str):
+        self.nonce = nonce
+        super().__init__(discord.ui.Button(
+            label="Stop", style=discord.ButtonStyle.danger,
+            custom_id=f"hermes:card:stop:{nonce}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match.group("nonce"))
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        adapter = getattr(interaction.client, "_hermes_discord_adapter", None)
+        if adapter is None:
+            await interaction.followup.send("nothing running", ephemeral=True)
+            return
+        await adapter.handle_status_card_stop(interaction, self.nonce)
+
+
+class StatusCardView(discord.ui.LayoutView):
+    def __init__(
+        self, tasks: list[dict[str, str]], *, nonce: Optional[str], title: str,
+        state: str, elapsed_s: float, iteration: int, max_iterations: int,
+    ):
+        super().__init__(timeout=None)
+        texts = render_status_card_texts(
+            tasks, title=title, state=state, elapsed_s=elapsed_s,
+            iteration=iteration, max_iterations=max_iterations,
+        )
+        children: list[Any] = [discord.ui.TextDisplay(texts[0]), discord.ui.TextDisplay(texts[1])]
+        if len(texts) > 2:
+            children.append(discord.ui.Separator())
+            children.extend(discord.ui.TextDisplay(text) for text in texts[2:])
+        if state == "running" and nonce:
+            children.append(discord.ui.ActionRow(StopCardButton(nonce)))
+        self.add_item(discord.ui.Container(
+            *children, accent_colour=_STATE_COLOURS.get(state, _STATE_COLOURS["running"]),
+        ))
+        if self.content_length() > _DISPLAY_LIMIT or self.total_children_count > 40:
+            raise ValueError("status card exceeds Discord component limits")
+
+
+@dataclass
+class StatusCardFrame:
+    tasks: list[dict[str, str]]
+    title: str
+    state: str
+    elapsed_s: float
+    iteration: int
+    max_iterations: int
+
+
+class StatusCardCoalescer:
+    def __init__(
+        self, edit: Callable[[StatusCardFrame], Awaitable[SendResult]], *, interval: float = 1.5,
+    ):
+        self._edit = edit
+        self._interval = interval
+        self._latest: Optional[StatusCardFrame] = None
+        self._task: Optional[asyncio.Task] = None
+        self._last_edit = 0.0
+        self._lock = asyncio.Lock()
+        self._stopped = False
+
+    async def submit(self, frame: StatusCardFrame) -> SendResult:
+        async with self._lock:
+            if self._stopped:
+                return SendResult(success=False, error="status card stopped")
+            self._latest = frame
+            remaining = self._interval - (time.monotonic() - self._last_edit)
+            if remaining <= 0 and self._task is None:
+                self._latest = None
+                result = await self._edit(frame)
+                if result.success:
+                    self._last_edit = time.monotonic()
+                return result
+            if self._task is None:
+                self._task = asyncio.create_task(self._drain(max(0.0, remaining)))
+            return SendResult(success=True)
+
+    async def _drain(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            async with self._lock:
+                frame = self._latest
+                self._latest = None
+                if self._stopped or frame is None:
+                    return
+                result = await self._edit(frame)
+                if result.success:
+                    self._last_edit = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._task is asyncio.current_task():
+                self._task = None
+
+    async def stop(self, *, flush: bool) -> SendResult:
+        task = self._task
+        self._task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            frame = self._latest
+            self._latest = None
+            self._stopped = True
+            if flush and frame is not None:
+                result = await self._edit(frame)
+                if result.success:
+                    self._last_edit = time.monotonic()
+                return result
+        return SendResult(success=True)
+
+
+@dataclass
+class CardState:
+    nonce: str
+    generation: int
+    session_key: str
+    chat_id: str
+    thread_key: str
+    channel_id: str
+    message: Any
+    tasks: list[dict[str, str]]
+    state: str
+    started_at: float
+    title: str
+    elapsed_s: float = 0.0
+    iteration: int = 0
+    max_iterations: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    coalescer: Optional[StatusCardCoalescer] = None
+
+    def frame(self) -> StatusCardFrame:
+        return StatusCardFrame(
+            tasks=[dict(task) for task in self.tasks], title=self.title, state=self.state,
+            elapsed_s=self.elapsed_s, iteration=self.iteration,
+            max_iterations=self.max_iterations,
+        )
