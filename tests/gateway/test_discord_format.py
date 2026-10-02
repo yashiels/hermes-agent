@@ -43,6 +43,21 @@ class TestDiscordFormatMessage:
         assert out.rstrip().endswith("Done.")
         assert "|---" not in out
 
+    def test_horizontal_rule_dropped_and_deep_header_collapsed(self):
+        adapter = _make_discord_adapter()
+        text = "#### Heading\n\nIntro.\n\n---\n\nMore text."
+        out = adapter.format_message(text)
+        assert out.startswith("### Heading")
+        assert "---" not in out
+        assert "Intro." in out
+        assert "More text." in out
+
+    def test_fenced_code_survives_table_and_rule_transforms(self):
+        adapter = _make_discord_adapter()
+        text = "```\n| a | b |\n|---|---|\n#### not a header\n```"
+        out = adapter.format_message(text)
+        assert out == text
+
 
 class TestDiscordToolPreviewFormatting:
     def test_truncated_url_keeps_full_click_target(self):

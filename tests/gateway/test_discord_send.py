@@ -152,6 +152,41 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     assert send_calls[2]["reference"] is None
 
 
+@pytest.mark.asyncio
+async def test_send_renders_table_and_rule_once_across_split_chunks():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    ids = iter(range(2001, 9999))
+
+    channel = SimpleNamespace(
+        send=AsyncMock(side_effect=lambda **_kw: SimpleNamespace(id=next(ids)))
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    filler = "x" * (adapter.MAX_MESSAGE_LENGTH + 500)
+    content = (
+        "#### Heading\n"
+        "| Name | Score |\n"
+        "|------|-------|\n"
+        "| Alice | 95   |\n"
+        f"{filler}\n\n---\n\nTail."
+    )
+    result = await adapter.send("555", content)
+
+    assert result.success is True
+    assert channel.send.await_count >= 2
+    sent_chunks = [call.kwargs["content"] for call in channel.send.await_args_list]
+    full_text = "".join(sent_chunks)
+    assert "### Heading" in sent_chunks[0]
+    assert "**Alice**" in sent_chunks[0]
+    assert "• Score:" in sent_chunks[0]
+    assert "|---" not in full_text
+    assert "\n---\n" not in full_text
+    assert "Tail." in sent_chunks[-1]
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
