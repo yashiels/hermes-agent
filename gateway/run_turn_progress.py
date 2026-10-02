@@ -374,6 +374,10 @@ class GatewayTurnProgressMixin:
         def visible_tasks(self) -> list[dict[str, str]]:
             return [self.tasks[task_id] for task_id in self.task_order[-8:]]
 
+        def history_tasks(self) -> tuple[list[dict[str, str]], int]:
+            selected_ids = self.task_order[-300:]
+            return [self.tasks[task_id] for task_id in selected_ids], len(self.task_order) - len(selected_ids)
+
         def fallback_text(self) -> str:
             labels = {"in_progress": t("gateway.progress.task_status_running"),
                       "complete": t("gateway.progress.task_status_complete"),
@@ -456,9 +460,16 @@ class GatewayTurnProgressMixin:
             if st.publication_suppressed:
                 return
         if not st.native_failed:
+            card_metadata = ctx._progress_metadata
+            if getattr(st.adapter, "native_task_card_full_history", False):
+                card_tasks, rows_omitted = st.history_tasks()
+                card_metadata = dict(card_metadata or {})
+                card_metadata["status_card_rows_omitted"] = rows_omitted
+            else:
+                card_tasks = st.visible_tasks()
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=t("gateway.progress.task_card_title"),
-                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
+                chat_id=ctx.source.chat_id, tasks=card_tasks, title=t("gateway.progress.task_card_title"),
+                reply_to=ctx._progress_reply_to, metadata=card_metadata, fallback_text=st.fallback_text(),
             )
             if getattr(result, "success", False):
                 return
@@ -557,7 +568,7 @@ class GatewayTurnProgressMixin:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.debug("task-card stop failed during turn cleanup", exc_info=True)
+                    logger.warning("task-card stop failed during turn cleanup", exc_info=True)
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
