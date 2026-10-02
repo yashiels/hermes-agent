@@ -42,9 +42,10 @@ class FakeMessage:
 
 
 class FakeView:
-    def __init__(self):
+    def __init__(self, approval_state_callback=None):
         self.resolved = False
         self.children = [SimpleNamespace(disabled=False)]
+        self.approval_state_callback = approval_state_callback
 
     def _disable_all(self):
         for child in self.children:
@@ -96,22 +97,59 @@ def test_registry_clear_run_only_matches_session_and_generation():
 
 
 @pytest.mark.asyncio
-async def test_resolve_approval_prompt_returns_stamp_and_mutates_view():
-    view = FakeView()
+async def test_resolve_approval_prompt_finalizes_and_calls_state_callback():
+    callback_calls = {"n": 0}
+
+    async def cb():
+        callback_calls["n"] += 1
+
+    view = FakeView(approval_state_callback=cb)
+    finalized = {}
+
+    async def finalize(color, footer):
+        finalized["color"] = color
+        finalized["footer"] = footer
+
     with patch("tools.approval.resolve_gateway_approval", return_value=1):
-        stamp = await resolve_approval_prompt("session-1", "once", "alice", view=view)
-    assert stamp is not None
-    color, footer = stamp
-    assert "alice" in footer
-    assert view.resolved is True
-    assert view.children[0].disabled is True
+        count = await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize)
+    assert count == 1
+    assert "alice" in finalized["footer"]
+    assert callback_calls == {"n": 1}
 
 
 @pytest.mark.asyncio
-async def test_resolve_approval_prompt_already_resolved_returns_none():
+async def test_resolve_approval_prompt_already_resolved_skips_finalize_and_callback():
+    callback_calls = {"n": 0}
+
+    async def cb():
+        callback_calls["n"] += 1
+
+    view = FakeView(approval_state_callback=cb)
+    finalize = AsyncMock()
+
     with patch("tools.approval.resolve_gateway_approval", return_value=0):
-        stamp = await resolve_approval_prompt("session-1", "once", "alice")
-    assert stamp is None
+        count = await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize)
+    assert count == 0
+    finalize.assert_not_awaited()
+    assert callback_calls == {"n": 0}
+
+
+@pytest.mark.asyncio
+async def test_resolve_approval_prompt_calls_callback_even_when_finalize_raises():
+    callback_calls = {"n": 0}
+
+    async def cb():
+        callback_calls["n"] += 1
+
+    view = FakeView(approval_state_callback=cb)
+
+    async def finalize(color, footer):
+        raise RuntimeError("boom")
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=1):
+        with pytest.raises(RuntimeError):
+            await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize)
+    assert callback_calls == {"n": 1}
 
 
 @pytest.mark.asyncio

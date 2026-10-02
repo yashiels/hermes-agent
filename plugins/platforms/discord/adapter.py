@@ -6119,6 +6119,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 admin_user_ids=admin_user_ids, allow_permanent="always" in choices,
                 allow_session="session" in choices, smart_denied=prompt.smart_denied,
                 approval_state_callback=_restore_running,
+                lock_registry=getattr(self, "_reaction_registry", None),
             )
             view_holder["view"] = view
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -6932,13 +6933,15 @@ def _define_discord_view_classes() -> None:
             self, session_key: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
             require_admin: bool = False, admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True, allow_session: bool = True, smart_denied: bool = False,
-            approval_state_callback: Optional[Callable] = None,
+            approval_state_callback: Optional[Callable] = None, lock_registry: Optional[Any] = None,
         ):
             super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
             self.require_admin = require_admin
             self.admin_user_ids = {str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()}
             self.approval_state_callback = approval_state_callback
+            self._lock_registry = lock_registry
+            self._own_lock = asyncio.Lock()
             self._localize_buttons(
                 allow_once="gateway.exec_approval.action_once", allow_session="gateway.exec_approval.action_session",
                 allow_always="gateway.exec_approval.action_always", deny="gateway.exec_approval.action_deny")
@@ -6970,26 +6973,35 @@ def _define_discord_view_classes() -> None:
                 )
             return authorized
 
+        def _lock_for(self, message: Any) -> asyncio.Lock:
+            if self._lock_registry is not None:
+                return self._lock_registry.lock_for(message.id)
+            return self._own_lock
+
         async def _resolve(self, interaction: discord.Interaction, choice: str):
             if not await self._gate(
                 interaction, resolved_msg=t("platform.discord.approval.already_resolved"),
                 unauth_msg=_unauthorized(),
             ):
                 return
-            stamp = await resolve_approval_prompt(
-                self.session_key, choice, interaction.user.display_name, view=self,
-            )
-            if stamp is None:
-                await interaction.response.send_message(
-                    t("platform.discord.approval.already_resolved"), ephemeral=True,
+            async with self._lock_for(interaction.message):
+                if self.resolved:
+                    return
+                self.resolved = True
+                count = await resolve_approval_prompt(
+                    self.session_key, choice, interaction.user.display_name, view=self,
+                    finalize=lambda color, footer: self._finalize_embed(interaction, color, footer),
                 )
-                return
-            color, footer = stamp
-            try:
-                await self._finalize_embed(interaction, color, footer)
-            finally:
-                if self.approval_state_callback is not None:
-                    await self.approval_state_callback()
+                if not count:
+                    try:
+                        await self._finalize_embed(
+                            interaction, discord.Color.dark_grey(), t("platform.discord.approval.expired"),
+                        )
+                    finally:
+                        if self.approval_state_callback is not None:
+                            await self.approval_state_callback()
+                elif self._lock_registry is not None:
+                    self._lock_registry.discard(interaction.message.id)
 
         async def on_timeout(self):
             try:

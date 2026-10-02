@@ -1,9 +1,11 @@
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from agent.i18n import t
 from gateway.config import PlatformConfig
 
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
@@ -227,12 +229,12 @@ async def test_button_and_reaction_parity_for_approval_once():
     assert reaction_view.resolved is True
     assert button_embed.color == reaction_embed.color
     assert button_embed.footer == reaction_embed.footer
-    assert callback_calls == {"button": 1, "reaction": 0}
+    assert callback_calls == {"button": 1, "reaction": 1}
     assert adapter._reaction_registry.get("reaction-msg") is None
 
 
 @pytest.mark.asyncio
-async def test_button_expired_elsewhere_sends_ephemeral_without_editing():
+async def test_button_zero_result_restores_previous_expired_behavior():
     callback_calls = {"n": 0}
 
     async def cb():
@@ -244,6 +246,51 @@ async def test_button_expired_elsewhere_sends_ephemeral_without_editing():
     with patch("tools.approval.resolve_gateway_approval", return_value=0):
         await view._resolve(interaction, "once")
 
-    interaction.response.edit_message.assert_not_awaited()
-    interaction.response.send_message.assert_awaited_once()
-    assert callback_calls == {"n": 0}
+    interaction.response.edit_message.assert_awaited_once()
+    interaction.response.send_message.assert_not_awaited()
+    assert embed.color == discord_platform.discord.Color.dark_grey()
+    assert embed.footer == t("platform.discord.approval.expired")
+    assert view.resolved is True
+    assert callback_calls == {"n": 1}
+
+
+@pytest.mark.asyncio
+async def test_button_and_reaction_share_the_approval_lock():
+    adapter = _make_adapter(reaction_controls=True)
+    adapter._allowed_user_ids = {"42"}
+
+    calls = []
+
+    def fake_resolve(session_key, choice):
+        calls.append((session_key, choice))
+        return 1 if len(calls) == 1 else 0
+
+    callback_calls = {"n": 0}
+
+    async def cb():
+        callback_calls["n"] += 1
+
+    shared_view = ExecApprovalView(
+        session_key="shared-session", allowed_user_ids={"42"},
+        approval_state_callback=cb, lock_registry=adapter._reaction_registry,
+    )
+    reaction_message = FakeMessage("shared-msg")
+    adapter._reaction_registry.register_approval(
+        "shared-msg", session_key="shared-session", require_admin=False, admin_user_ids=set(),
+        expires_at=time.time() + 60, message=reaction_message, view=shared_view,
+    )
+    interaction, _embed = _interaction()
+    interaction.message = SimpleNamespace(id="shared-msg", embeds=[FakeEmbed()])
+
+    reactor = SimpleNamespace(roles=[], display_name="alice")
+    payload = SimpleNamespace(user_id=42, message_id="shared-msg", emoji=EMOJI_APPROVE, member=reactor, guild_id=None)
+
+    with patch("tools.approval.resolve_gateway_approval", side_effect=fake_resolve):
+        await asyncio.gather(
+            shared_view._resolve(interaction, "once"),
+            handle_raw_reaction_add(adapter, payload),
+        )
+
+    assert len(calls) == 1
+    assert callback_calls == {"n": 1}
+    assert shared_view.resolved is True

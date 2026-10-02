@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 try:
     import discord
@@ -95,8 +95,9 @@ class ReactionControlRegistry:
 
 
 async def resolve_approval_prompt(
-    session_key: str, choice: str, actor: str, *, view: Optional[Any] = None,
-) -> Optional[Tuple[Any, str]]:
+    session_key: str, choice: str, actor: str, *, view: Any,
+    finalize: Callable[[Any, str], Awaitable[None]],
+) -> int:
     from tools.approval import resolve_gateway_approval
     try:
         count = resolve_gateway_approval(session_key, choice)
@@ -104,19 +105,20 @@ async def resolve_approval_prompt(
         logger.error("[Discord] Failed to resolve gateway approval for session %s: %s", session_key, exc)
         count = 0
     if not count:
-        return None
+        return 0
     logger.info(
         "Discord resolved %d approval(s) for session %s (choice=%s, actor=%s)",
         count, session_key, choice, actor,
     )
     label_key, color_fn = _APPROVAL_STYLE.get(choice, _APPROVAL_STYLE["deny"])
     footer = t("platform.discord.approval.by_user", label=t(label_key), user=actor)
-    if view is not None:
-        view.resolved = True
-        disable_all = getattr(view, "_disable_all", None)
-        if callable(disable_all):
-            disable_all()
-    return color_fn(), footer
+    try:
+        await finalize(color_fn(), footer)
+    finally:
+        callback = getattr(view, "approval_state_callback", None)
+        if callback is not None:
+            await callback()
+    return count
 
 
 async def _reactor_member_role_ids(adapter: Any, payload: Any) -> Optional[set]:
@@ -186,24 +188,36 @@ async def _handle_approval_reaction(adapter: Any, payload: Any, entry: Dict[str,
         entry = registry.get(payload.message_id)
         if entry is None or entry.get("kind") != "approval":
             return
+        view = entry.get("view")
+        if getattr(view, "resolved", False):
+            return
+        message = entry.get("message")
+
+        async def _finalize(color: Any, footer: str) -> None:
+            embed = message.embeds[0] if getattr(message, "embeds", None) else None
+            if embed is not None:
+                embed.color = color
+                embed.set_footer(text=footer)
+            if view is not None:
+                view.resolved = True
+                disable_all = getattr(view, "_disable_all", None)
+                if callable(disable_all):
+                    disable_all()
+            try:
+                await message.edit(embed=embed, view=view)
+            except Exception:
+                logger.debug("[Discord] Failed to edit approval prompt after reaction resolve", exc_info=True)
+
         actor = _reactor_display_name(payload)
-        stamp = await resolve_approval_prompt(entry["session_key"], choice, actor, view=entry.get("view"))
-        if stamp is None:
+        count = await resolve_approval_prompt(
+            entry["session_key"], choice, actor, view=view, finalize=_finalize,
+        )
+        if not count:
             logger.debug(
                 "[Discord] Reaction approval resolve no-op for session %s (choice=%s): already resolved or expired",
                 entry["session_key"], choice,
             )
             return
-        color, footer = stamp
-        message = entry.get("message")
-        embed = message.embeds[0] if getattr(message, "embeds", None) else None
-        if embed is not None:
-            embed.color = color
-            embed.set_footer(text=footer)
-        try:
-            await message.edit(embed=embed, view=entry.get("view"))
-        except Exception:
-            logger.debug("[Discord] Failed to edit approval prompt after reaction resolve", exc_info=True)
         registry.discard(payload.message_id)
 
 
