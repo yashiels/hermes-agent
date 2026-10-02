@@ -4506,11 +4506,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(atomic_json_write, path, snapshot, indent=None)
 
+    async def _remove_status_card_persistence(self, card: CardState) -> None:
+        persisted = self._status_card_persisted.pop(card.nonce, None)
+        try:
+            await self._persist_status_cards()
+        except Exception:
+            if persisted is not None:
+                self._status_card_persisted[card.nonce] = persisted
+            raise
+
     async def _disable_status_card_after_permanent_failure(
         self, card: CardState, *, send_fallback: bool,
     ) -> None:
         if not await self._compare_pop_status_card(card):
             return
+        await self._remove_status_card_persistence(card)
         if not send_fallback or card.fallback_sent:
             card.fallback_sent = True
             return
@@ -4552,9 +4562,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if attempt < 2:
                     await asyncio.sleep(0.25 * (2 ** attempt))
             notice_succeeded = False
+            controls_removed = False
             if not terminal_succeeded:
                 try:
                     await card.message.edit(view=None)
+                    controls_removed = True
                 except Exception:
                     pass
                 notice_metadata = dict(card.delivery_metadata)
@@ -4569,16 +4581,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     notice_succeeded = bool(notice.success)
                 except Exception:
                     logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
-            completed = terminal_succeeded or notice_succeeded
+            completed = terminal_succeeded or controls_removed or notice_succeeded
             await self._compare_pop_status_card(card)
             if completed:
-                persisted = self._status_card_persisted.pop(card.nonce, None)
-                try:
-                    await self._persist_status_cards()
-                except Exception:
-                    if persisted is not None:
-                        self._status_card_persisted[card.nonce] = persisted
-                    raise
+                await self._remove_status_card_persistence(card)
                 card.terminal_completed = True
             return completed
 
@@ -4657,9 +4663,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         key = self._status_card_key(chat_id, metadata)
         card = self._status_cards.get(key)
         if card is not None and card.nonce != run["nonce"]:
-            await self._terminalize_status_card(
+            superseded_closed = await self._terminalize_status_card(
                 card, outcome="interrupted", metadata=card.delivery_metadata,
             )
+            if not superseded_closed:
+                logger.warning(
+                    "[Discord] Superseded status card %s could not be terminalized; restart reconciliation will retry",
+                    card.nonce,
+                )
             card = None
         if card is None:
             try:

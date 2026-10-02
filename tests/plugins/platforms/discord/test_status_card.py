@@ -228,6 +228,32 @@ async def test_old_finalize_cannot_pop_new_card(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_supersession_keeps_old_persistence_and_creates_replacement(
+    tmp_path, monkeypatch, caplog,
+):
+    channel = FakeChannel(new_message_each_send=True)
+    adapter, _channel = make_adapter(tmp_path, monkeypatch, channel=channel)
+    old = run_metadata(generation=1, nonce="1111111111111111")
+    new = run_metadata(generation=2, nonce="2222222222222222")
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Old", "status": "running"}], metadata=old,
+    )
+    channel.message.failures = [ConnectionError("offline") for _ in range(4)]
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline", retryable=True))
+
+    result = await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "2", "title": "New", "status": "running"}], metadata=new,
+    )
+
+    assert result.success is True
+    key = adapter._status_card_keys_by_nonce["2222222222222222"]
+    assert adapter._status_cards[key].nonce == "2222222222222222"
+    persisted = json.loads(adapter._status_card_persistence_path.read_text())
+    assert {entry["nonce"] for entry in persisted} == {"1111111111111111", "2222222222222222"}
+    assert "restart reconciliation will retry" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_coalescer_cancellation_drops_throttled_frame():
     edits = []
 
@@ -322,6 +348,23 @@ async def test_terminal_edit_and_notice_failure_keep_persistence(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_view_removal_success_clears_persistence_when_notice_fails(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    channel.message.failures = [ConnectionError("offline") for _ in range(3)]
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline", retryable=True))
+
+    assert await adapter.finalize_native_task_card(
+        "channel-1", outcome="failed", reply_to=None, metadata=metadata,
+    ) is True
+    assert channel.message.edits[-1] == {"view": None}
+    assert json.loads(adapter._status_card_persistence_path.read_text()) == []
+
+
+@pytest.mark.asyncio
 async def test_components_v2_validation_failure_returns_text_fallback_signal(tmp_path, monkeypatch):
     channel = FakeChannel()
     channel.failure = DiscordFailure("Invalid Form Body", status=400, code=50035)
@@ -384,6 +427,7 @@ async def test_delayed_permanent_edit_failure_disables_card_and_sends_fallback(t
 
     assert result.success is True
     assert not adapter._status_cards
+    assert json.loads(adapter._status_card_persistence_path.read_text()) == []
     adapter.send.assert_awaited_once_with(
         "channel-1", "Inspect · running", metadata=metadata,
     )
