@@ -32,6 +32,7 @@ _TASK_MARKERS = {
     "pending": "○",
     "in_progress": "◐",
     "running": "◐",
+    "complete": "✓",
     "completed": "✓",
     "done": "✓",
     "failed": "✗",
@@ -243,6 +244,6 @@ class CardState:
     def frame(self) -> StatusCardFrame:
         return StatusCardFrame(
             tasks=[dict(task) for task in self.tasks], title=self.title, state=self.state,
-            elapsed_s=self.elapsed_s, iteration=self.iteration,
+            elapsed_s=max(self.elapsed_s, time.time() - self.started_at), iteration=self.iteration,
             max_iterations=self.max_iterations,
         )

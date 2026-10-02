@@ -651,3 +651,17 @@ async def test_activity_hook_reports_only_live_accepted_cards(tmp_path, monkeypa
     assert await adapter.update_native_task_card_activity(
         "channel-1", elapsed_s=3, iteration=1, max_iterations=5, metadata=metadata,
     ) is True
+
+
+def test_complete_task_status_renders_check_marker():
+    from plugins.platforms.discord.status_card import _TASK_MARKERS
+    assert _TASK_MARKERS["complete"] == "✓"
+
+
+def test_card_frame_elapsed_tracks_wall_clock(monkeypatch):
+    import plugins.platforms.discord.status_card as status_card
+    card = status_card.CardState.__new__(status_card.CardState)
+    card.tasks, card.title, card.state, card.elapsed_s = [], "t", "running", 0.0
+    card.iteration, card.max_iterations, card.started_at = 0, 0, 1000.0
+    monkeypatch.setattr(status_card.time, "time", lambda: 1095.0)
+    assert status_card.CardState.frame(card).elapsed_s == 95.0
