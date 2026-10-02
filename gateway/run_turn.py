@@ -3179,6 +3179,9 @@ class GatewayTurnMixin:
             ),
             platform=source.platform,
         )
+        if _native_slack_task_cards and source.platform == Platform.DISCORD and source.user_id:
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata.setdefault("owner_user_id", source.user_id)
         if _native_slack_task_cards and source.platform == Platform.SLACK:
             # chat.startStream in channels requires the recipient team/user pair; harmless elsewhere.
             _progress_metadata = dict(_progress_metadata or {})

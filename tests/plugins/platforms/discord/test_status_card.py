@@ -1,6 +1,7 @@
 import asyncio
 import json
 import queue
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -89,10 +90,14 @@ from gateway.platforms.base import SendResult
 from gateway.run_turn_runner import TurnRunner
 from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.discord.status_card import (
+    ShowAllCardButton,
     StatusCardCoalescer,
     StatusCardFrame,
     StatusCardView,
     StopCardButton,
+    build_status_card_history_markdown,
+    prune_status_card_history,
+    status_card_history_rows,
 )
 
 
@@ -156,6 +161,7 @@ def make_adapter(tmp_path, monkeypatch, *, enabled=True, channel=None):
     ))
     adapter._client = object()
     adapter._status_card_persistence_path = tmp_path / "state" / "discord_status_cards.json"
+    adapter._status_card_history_path = tmp_path / "state" / "discord_status_card_history.json"
     channel = channel or FakeChannel()
     monkeypatch.setattr(adapter, "_resolve_channel", AsyncMock(return_value=channel))
     return adapter, channel
@@ -163,6 +169,27 @@ def make_adapter(tmp_path, monkeypatch, *, enabled=True, channel=None):
 
 def view_texts(view):
     return [item.content for item in view.walk_children() if hasattr(item, "content")]
+
+
+def view_buttons(view):
+    return [item for item in view.walk_children() if hasattr(item, "custom_id")]
+
+
+def show_all_interaction(adapter, *, user_id=7, roles=None, order=None):
+    async def defer(**_kwargs):
+        if order is not None:
+            order.append("defer")
+
+    async def send(*_args, **_kwargs):
+        if order is not None:
+            order.append("followup")
+
+    return SimpleNamespace(
+        client=SimpleNamespace(_hermes_discord_adapter=adapter),
+        user=SimpleNamespace(id=user_id, roles=list(roles or [])),
+        response=SimpleNamespace(defer=AsyncMock(side_effect=defer)),
+        followup=SimpleNamespace(send=AsyncMock(side_effect=send)),
+    )
 
 
 def test_status_card_view_trims_text_and_components():
@@ -178,6 +205,23 @@ def test_status_card_view_trims_text_and_components():
     assert view.content_length() <= 3800
     assert view.total_children_count <= 40
     assert any("+4 earlier" in text for text in view_texts(view))
+
+
+def test_show_all_button_only_appears_past_display_limit():
+    eight = [{"title": f"Task {index}", "status": "complete"} for index in range(8)]
+    nine = eight + [{"title": "Task 8", "status": "complete"}]
+    without_button = StatusCardView(
+        eight, nonce=None, title="Hermes run", state="done", elapsed_s=1,
+        iteration=0, max_iterations=0, history_nonce="a" * 32,
+    )
+    with_button = StatusCardView(
+        nine, nonce=None, title="Hermes run", state="done", elapsed_s=1,
+        iteration=0, max_iterations=0, history_nonce="b" * 32,
+    )
+
+    assert [button.label for button in view_buttons(without_button)] == []
+    assert [button.label for button in view_buttons(with_button)] == ["Show all"]
+    assert view_buttons(with_button)[0].custom_id == f"hermes:card:all:{'b' * 32}"
 
 
 def test_run_control_capability_follows_native_or_reaction_flag(tmp_path, monkeypatch):
@@ -200,6 +244,32 @@ async def test_status_card_send_uses_only_components_view(tmp_path, monkeypatch)
     assert result.success is True
     assert set(channel.sends[0]) == {"view"}
     assert isinstance(channel.sends[0]["view"], StatusCardView)
+
+
+@pytest.mark.asyncio
+async def test_discord_task_card_publish_keeps_all_rows_for_terminal_history():
+    adapter = SimpleNamespace(
+        native_task_card_full_history=True,
+        send_native_task_card_progress=AsyncMock(return_value=SendResult(success=True, message_id="1")),
+    )
+    context = SimpleNamespace(
+        source=SimpleNamespace(chat_id="channel-1"),
+        _progress_reply_to=None,
+        _progress_metadata=run_metadata(),
+        tool_progress_enabled=False,
+    )
+    runner = TurnRunner(None, context)
+    state = runner._TaskCardState(adapter)
+    for index in range(9):
+        state.apply_event({
+            "type": "tool.started", "tool_call_id": str(index), "tool_name": f"tool-{index}",
+        })
+
+    await runner._task_card_publish(state)
+
+    sent_tasks = adapter.send_native_task_card_progress.await_args.kwargs["tasks"]
+    assert len(sent_tasks) == 9
+    assert len(state.visible_tasks()) == 8
 
 
 @pytest.mark.asyncio
@@ -629,6 +699,152 @@ async def test_authorized_stop_defers_then_calls_current_run_control(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_show_all_nonce_is_generated_separately_on_terminalization(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    adapter._allowed_user_ids = {"7"}
+    metadata = run_metadata()
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    await adapter.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
+
+    assert await adapter.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    ) is True
+
+    button = view_buttons(channel.message.edits[-1]["view"])[0]
+    history_nonce = button.custom_id.rsplit(":", 1)[-1]
+    assert button.label == "Show all"
+    assert re.fullmatch(r"[0-9a-f]{32}", history_nonce)
+    assert history_nonce != metadata["hermes_run"]["nonce"]
+    stored = json.loads(adapter._status_card_history_path.read_text())
+    assert stored[0]["nonce"] == history_nonce
+    assert stored[0]["allowed_user_ids"] == ["7"]
+
+
+@pytest.mark.asyncio
+async def test_show_all_callback_defers_before_adapter_io(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    order = []
+
+    async def handle(_interaction, _nonce):
+        order.append("io")
+
+    adapter.handle_status_card_show_all = handle
+    interaction = show_all_interaction(adapter, order=order)
+
+    await ShowAllCardButton("a" * 32).callback(interaction)
+
+    assert order == ["defer", "io"]
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+
+
+@pytest.mark.asyncio
+async def test_show_all_rejects_unauthorized_principal(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    adapter._allowed_user_ids = {"42"}
+    metadata = run_metadata()
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    await adapter.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
+    await adapter.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    )
+    nonce = next(iter(adapter._status_card_history))
+    interaction = show_all_interaction(adapter, user_id=7)
+
+    with patch("gateway.pairing.PairingStore") as store:
+        store.return_value.is_approved.return_value = False
+        await ShowAllCardButton(nonce).callback(interaction)
+
+    interaction.followup.send.assert_awaited_once()
+    assert "allowed list" in interaction.followup.send.await_args.args[0].lower()
+    assert "file" not in interaction.followup.send.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired", [False, True])
+async def test_show_all_reports_missing_or_expired_history(tmp_path, monkeypatch, expired):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    nonce = "c" * 32
+    if expired:
+        path = adapter._status_card_history_path
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps([{
+            "nonce": nonce,
+            "finished_at": time.time() - 31 * 24 * 60 * 60,
+            "rows": ["✓ Old"],
+        }]))
+    interaction = show_all_interaction(adapter)
+
+    await ShowAllCardButton(nonce).callback(interaction)
+
+    interaction.followup.send.assert_awaited_once_with("Detailed history expired.", ephemeral=True)
+
+
+@pytest.mark.asyncio
+async def test_show_all_sends_utf8_markdown_with_header_and_rows(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    adapter._allowed_user_ids = {"7"}
+    metadata = run_metadata()
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    await adapter.send_native_task_card_progress(
+        "channel-1", tasks, metadata=metadata, title="Hermes run",
+    )
+    await adapter.finalize_native_task_card(
+        "channel-1", outcome="failed", reply_to=None, metadata=metadata,
+    )
+    nonce = next(iter(adapter._status_card_history))
+    captured = {}
+
+    def make_file(stream, *, filename):
+        captured["data"] = stream.getvalue()
+        captured["filename"] = filename
+        return SimpleNamespace(filename=filename)
+
+    monkeypatch.setattr(discord, "File", make_file)
+    interaction = show_all_interaction(adapter)
+
+    await ShowAllCardButton(nonce).callback(interaction)
+
+    text = captured["data"].decode("utf-8")
+    assert text.startswith("# Hermes run")
+    assert "- State: failed" in text
+    assert "- Elapsed:" in text
+    assert "- Finished:" in text
+    assert "- ✓ Task 0" in text
+    assert "- ✓ Task 8" in text
+    assert re.fullmatch(r"hermes-run-\d{8}T\d{6}Z\.md", captured["filename"])
+    interaction.followup.send.assert_awaited_once()
+    assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+
+@pytest.mark.asyncio
+async def test_fresh_adapter_loads_history_and_serves_show_all(tmp_path, monkeypatch):
+    first, _channel = make_adapter(tmp_path, monkeypatch)
+    first._allowed_user_ids = {"7"}
+    metadata = run_metadata()
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    await first.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
+    await first.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    )
+    nonce = next(iter(first._status_card_history))
+
+    fresh, _fresh_channel = make_adapter(tmp_path, monkeypatch)
+    captured = {}
+
+    def make_file(stream, *, filename):
+        captured["data"] = stream.getvalue()
+        return SimpleNamespace(filename=filename)
+
+    monkeypatch.setattr(discord, "File", make_file)
+    interaction = show_all_interaction(fresh)
+
+    await ShowAllCardButton(nonce).callback(interaction)
+
+    assert "Task 0" in captured["data"].decode("utf-8")
+    assert nonce in fresh._status_card_history
+
+
+@pytest.mark.asyncio
 async def test_status_updates_edit_within_turn_and_isolate_generations(tmp_path, monkeypatch):
     adapter, _channel = make_adapter(tmp_path, monkeypatch)
     adapter.send = AsyncMock(side_effect=[
@@ -734,3 +950,88 @@ def test_terminal_states_replace_active_markers_without_changing_completed(state
 
     assert f"{marker} Active" in texts
     assert "✓ Finished" in texts
+
+
+def test_history_rows_redact_secrets_strip_queries_and_keep_compaction():
+    hex_secret = "a" * 40
+    base64_secret = "Zy9vK2Jhc2U2NF9Ub2tlbl9XaXRoXzMyQ2hhcnM="
+    tasks = [
+        {"title": "use sk-liveSecretValue", "status": "complete"},
+        {"title": "use ghp_abcdefghijklmnopqrstuvwxyz", "status": "complete"},
+        {"title": "use xoxb-123456789-secret", "status": "complete"},
+        {"title": f"use {hex_secret}", "status": "complete"},
+        {"title": f"use {base64_secret}", "status": "complete"},
+        {"title": "Authorization Bearer abc.def-ghi", "status": "complete"},
+        {"title": "fetch https://example.com/path?token=secret&x=1#section", "status": "complete"},
+        {"title": "space\n" + "x" * 200, "status": "complete"},
+    ]
+
+    rows, omitted = status_card_history_rows(tasks, "done")
+    joined = "\n".join(rows)
+
+    assert omitted == 0
+    assert joined.count("[REDACTED]") >= 6
+    assert "liveSecretValue" not in joined
+    assert "token=secret" not in joined
+    assert "https://example.com/path#section" in joined
+    assert all(len(row) <= 122 for row in rows)
+
+
+def test_history_pruning_enforces_age_card_and_row_bounds():
+    now = 2_000_000_000.0
+    entries = [{
+        "nonce": "expired",
+        "finished_at": now - 31 * 24 * 60 * 60,
+        "rows": ["old"],
+    }]
+    entries.extend({
+        "nonce": f"recent-{index}",
+        "finished_at": now - 1000 + index,
+        "rows": [f"row-{row}" for row in range(301)],
+    } for index in range(201))
+
+    pruned = prune_status_card_history(entries, now=now)
+
+    assert len(pruned) == 200
+    assert pruned[0]["nonce"] == "recent-1"
+    assert pruned[-1]["nonce"] == "recent-200"
+    assert all(len(entry["rows"]) == 300 for entry in pruned)
+
+
+def test_history_markdown_stays_below_cap_with_truncation_notice():
+    entry = {
+        "title": "Hermes run",
+        "state": "done",
+        "elapsed": 12,
+        "finished_at": 2_000_000_000.0,
+        "rows": ["✓ " + "界" * 120 for _ in range(300)],
+    }
+
+    data = build_status_card_history_markdown(entry, max_bytes=512)
+
+    assert len(data) < 512
+    assert "Detailed history truncated." in data.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_history_persistence_uses_atomic_write(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    metadata["owner_user_id"] = "7"
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+
+    with patch("plugins.platforms.discord.adapter.atomic_json_write") as atomic_write:
+        await adapter.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
+        await adapter.finalize_native_task_card(
+            "channel-1", outcome="done", reply_to=None, metadata=metadata,
+        )
+
+    history_calls = [
+        call for call in atomic_write.call_args_list
+        if call.args[0] == adapter._status_card_history_path
+    ]
+    assert len(history_calls) == 1
+    stored = history_calls[0].args[1][0]
+    assert stored["owner_user_id"] == "7"
+    assert len(stored["rows"]) == 9
+    assert "interaction_token" not in stored

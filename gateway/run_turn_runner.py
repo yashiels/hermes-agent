@@ -351,6 +351,9 @@ class TurnRunner:
         def visible_tasks(self) -> List[Dict[str, str]]:
             return [self.tasks[task_id] for task_id in self.task_order[-8:]]
 
+        def history_tasks(self) -> List[Dict[str, str]]:
+            return [self.tasks[task_id] for task_id in self.task_order[-300:]]
+
         def fallback_text(self) -> str:
             labels = {"in_progress": t("gateway.progress.task_status_running"),
                       "complete": t("gateway.progress.task_status_complete"),
@@ -433,8 +436,9 @@ class TurnRunner:
             if st.publication_suppressed:
                 return
         if not st.native_failed:
+            card_tasks = st.history_tasks() if getattr(st.adapter, "native_task_card_full_history", False) else st.visible_tasks()
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=t("gateway.progress.task_card_title"),
+                chat_id=ctx.source.chat_id, tasks=card_tasks, title=t("gateway.progress.task_card_title"),
                 reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
             )
             if getattr(result, "success", False):

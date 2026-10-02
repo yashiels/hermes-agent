@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 import discord
@@ -12,6 +14,11 @@ from gateway.platforms.base import SendResult
 
 _DISPLAY_LIMIT = 3800
 _TASK_LIMIT = 8
+_HISTORY_CARD_LIMIT = 200
+_HISTORY_ROW_LIMIT = 300
+_HISTORY_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+_HISTORY_FILE_MAX_BYTES = 8 * 1024 * 1024 - 1024
+_HISTORY_TRUNCATION_NOTICE = "\n\n> Detailed history truncated.\n"
 _STATE_LABELS = {
     "running": "running",
     "waiting-approval": "waiting for approval",
@@ -49,6 +56,15 @@ _TERMINAL_ACTIVE_MARKERS = {
     "interrupted": "⏹",
     "interrupted-restart": "⏹",
 }
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?#]+)\?[^\s#]*(#[^\s]*)?", re.IGNORECASE)
+_SECRET_PATTERNS = (
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
+    re.compile(r"\bsk-[A-Za-z0-9_-]+", re.IGNORECASE),
+    re.compile(r"\bghp_[A-Za-z0-9_-]+", re.IGNORECASE),
+    re.compile(r"\bxox[A-Za-z0-9_-]+", re.IGNORECASE),
+    re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32,}(?![0-9A-Fa-f])"),
+    re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/=])"),
+)
 
 
 def _elapsed_text(elapsed_s: float) -> str:
@@ -71,6 +87,23 @@ def _meta_text(state: str, elapsed_s: float, iteration: int, max_iterations: int
     return "-# " + " · ".join(parts)
 
 
+def _compact_task_title(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip() or "Task"
+    return text if len(text) <= 120 else text[:117].rstrip() + "..."
+
+
+def _task_marker(task: dict[str, str], state: str) -> str:
+    status = str(task.get("status") or "pending").strip().lower()
+    if status in {"in_progress", "running"} and state in _TERMINAL_ACTIVE_MARKERS:
+        return _TERMINAL_ACTIVE_MARKERS[state]
+    return _TASK_MARKERS.get(status, "○")
+
+
+def _task_line(task: dict[str, str], state: str) -> str:
+    title = _compact_task_title(task.get("title") or task.get("id") or "Task")
+    return f"{_task_marker(task, state)} {title}"
+
+
 def _task_texts(tasks: list[dict[str, str]], state: str) -> list[str]:
     visible = list(tasks[-_TASK_LIMIT:])
     lines = []
@@ -78,13 +111,89 @@ def _task_texts(tasks: list[dict[str, str]], state: str) -> list[str]:
     if hidden > 0:
         lines.append(f"-# +{hidden} earlier")
     for task in visible:
-        status = str(task.get("status") or "pending").strip().lower()
-        marker = _TASK_MARKERS.get(status, "○")
-        if status in {"in_progress", "running"} and state in _TERMINAL_ACTIVE_MARKERS:
-            marker = _TERMINAL_ACTIVE_MARKERS[state]
-        title = str(task.get("title") or task.get("id") or "Task").strip()
-        lines.append(f"{marker} {title}")
+        lines.append(_task_line(task, state))
     return lines
+
+
+def _sanitize_history_text(value: Any) -> str:
+    text = _URL_QUERY_RE.sub(lambda match: (match.group(1) or "") + (match.group(2) or ""), str(value or ""))
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def status_card_history_rows(
+    tasks: list[dict[str, str]], state: str,
+) -> tuple[list[str], int]:
+    rows = [
+        f"{_task_marker(task, state)} {_compact_task_title(_sanitize_history_text(task.get('title') or task.get('id') or 'Task'))}"
+        for task in tasks
+    ]
+    omitted = max(0, len(rows) - _HISTORY_ROW_LIMIT)
+    return rows[-_HISTORY_ROW_LIMIT:], omitted
+
+
+def prune_status_card_history(entries: list[dict[str, Any]], *, now: Optional[float] = None) -> list[dict[str, Any]]:
+    cutoff = (time.time() if now is None else now) - _HISTORY_MAX_AGE_SECONDS
+    kept = []
+    for entry in entries:
+        try:
+            finished_at = float(entry.get("finished_at"))
+        except (TypeError, ValueError):
+            continue
+        if finished_at < cutoff:
+            continue
+        bounded = dict(entry)
+        rows = bounded.get("rows")
+        bounded["rows"] = [str(row) for row in rows[-_HISTORY_ROW_LIMIT:]] if isinstance(rows, list) else []
+        kept.append(bounded)
+    kept.sort(key=lambda entry: float(entry["finished_at"]))
+    return kept[-_HISTORY_CARD_LIMIT:]
+
+
+def status_card_history_finished_text(finished_at: Any) -> str:
+    return datetime.fromtimestamp(float(finished_at), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def status_card_history_filename(finished_at: Any) -> str:
+    stamp = datetime.fromtimestamp(float(finished_at), timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"hermes-run-{stamp}.md"
+
+
+def _truncate_utf8(data: bytes, limit: int) -> bytes:
+    return data[:max(0, limit)].decode("utf-8", errors="ignore").encode("utf-8")
+
+
+def build_status_card_history_markdown(
+    entry: dict[str, Any], *, max_bytes: int = _HISTORY_FILE_MAX_BYTES,
+) -> bytes:
+    title = _compact_task_title(_sanitize_history_text(entry.get("title") or "Hermes run"))
+    header = (
+        f"# {title}\n\n"
+        f"- State: {entry.get('state') or 'unknown'}\n"
+        f"- Elapsed: {_elapsed_text(float(entry.get('elapsed') or 0.0))}\n"
+        f"- Finished: {status_card_history_finished_text(entry.get('finished_at'))}\n\n"
+        "## Steps\n"
+    ).encode("utf-8")
+    notice = _HISTORY_TRUNCATION_NOTICE.encode("utf-8")
+    limit = max(1, int(max_bytes) - 1)
+    if len(header) >= limit:
+        if len(notice) >= limit:
+            return _truncate_utf8(notice, limit)
+        return _truncate_utf8(header, limit - len(notice)) + notice
+    output = bytearray(header)
+    truncated = False
+    for row in entry.get("rows") or []:
+        line = f"- {row}\n".encode("utf-8")
+        if len(output) + len(line) + len(notice) > limit:
+            truncated = True
+            break
+        output.extend(line)
+    if entry.get("rows_omitted"):
+        truncated = True
+    if truncated:
+        output.extend(notice)
+    return bytes(output)
 
 
 def render_status_card_texts(
@@ -127,10 +236,35 @@ class StopCardButton(
         await adapter.handle_status_card_stop(interaction, self.nonce)
 
 
+class ShowAllCardButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"hermes:card:all:(?P<nonce>[0-9a-f]{32})",
+):
+    def __init__(self, nonce: str):
+        self.nonce = nonce
+        super().__init__(discord.ui.Button(
+            label="Show all", style=discord.ButtonStyle.secondary,
+            custom_id=f"hermes:card:all:{nonce}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match.group("nonce"))
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        adapter = getattr(interaction.client, "_hermes_discord_adapter", None)
+        if adapter is None:
+            await interaction.followup.send("Detailed history expired.", ephemeral=True)
+            return
+        await adapter.handle_status_card_show_all(interaction, self.nonce)
+
+
 class StatusCardView(discord.ui.LayoutView):
     def __init__(
         self, tasks: list[dict[str, str]], *, nonce: Optional[str], title: str,
         state: str, elapsed_s: float, iteration: int, max_iterations: int,
+        history_nonce: Optional[str] = None,
     ):
         super().__init__(timeout=None)
         texts = render_status_card_texts(
@@ -143,6 +277,8 @@ class StatusCardView(discord.ui.LayoutView):
             children.extend(discord.ui.TextDisplay(text) for text in texts[2:])
         if state == "running" and nonce:
             children.append(discord.ui.ActionRow(StopCardButton(nonce)))
+        if state in _TERMINAL_TITLES and history_nonce and len(tasks) > _TASK_LIMIT:
+            children.append(discord.ui.ActionRow(ShowAllCardButton(history_nonce)))
         self.add_item(discord.ui.Container(
             *children, accent_colour=_STATE_COLOURS.get(state, _STATE_COLOURS["running"]),
         ))
@@ -158,6 +294,7 @@ class StatusCardFrame:
     elapsed_s: float
     iteration: int
     max_iterations: int
+    history_nonce: Optional[str] = None
 
 
 class StatusCardCoalescer:
@@ -254,6 +391,7 @@ class CardState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     coalescer: Optional[StatusCardCoalescer] = None
     refresh_task: Optional[asyncio.Task] = None
+    history_nonce: Optional[str] = None
 
     def frame(self) -> StatusCardFrame:
         return StatusCardFrame(

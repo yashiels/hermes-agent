@@ -79,6 +79,26 @@ async def test_run_token_propagates_to_progress_and_status_metadata():
     assert status_metadata["hermes_run"] is not token
 
 
+def test_discord_progress_metadata_carries_history_owner(monkeypatch):
+    runner = SimpleNamespace(
+        _thread_metadata_for_progress=lambda *_args, **_kwargs: {"thread_id": "thread-1"},
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id="1", chat_type="dm", user_id="owner-7",
+    )
+    gateway_run = SimpleNamespace(
+        _non_conversational_metadata=lambda metadata, **_kwargs: dict(metadata or {}),
+        _resolve_progress_thread_id=lambda *_args, **_kwargs: "thread-1",
+    )
+    monkeypatch.setitem(sys.modules, "gateway.run", gateway_run)
+
+    metadata, _reply_to, _status = GatewayTurnMixin._run_agent_progress_threading(
+        runner, source, "message-1", True,
+    )
+
+    assert metadata["owner_user_id"] == "owner-7"
+
+
 @pytest.mark.asyncio
 async def test_flag_off_has_no_run_token_or_turn_hooks():
     adapter = HookAdapter(controls_enabled=False)

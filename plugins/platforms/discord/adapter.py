@@ -13,11 +13,13 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import struct
 import subprocess
 import tempfile
@@ -335,23 +337,38 @@ from gateway.platforms._shared import (
     yaml_env_setter as _yaml_env_setter
 )
 
-CardState = StatusCardCoalescer = StatusCardFrame = StatusCardView = StopCardButton = None
+CardState = StatusCardCoalescer = StatusCardFrame = StatusCardView = None
+StopCardButton = ShowAllCardButton = None
+build_status_card_history_markdown = prune_status_card_history = None
+status_card_history_filename = status_card_history_rows = None
 
 
 def _load_discord_status_card_types() -> None:
-    global CardState, StatusCardCoalescer, StatusCardFrame, StatusCardView, StopCardButton
+    global CardState, StatusCardCoalescer, StatusCardFrame, StatusCardView
+    global StopCardButton, ShowAllCardButton, build_status_card_history_markdown
+    global prune_status_card_history, status_card_history_filename, status_card_history_rows
     from plugins.platforms.discord.status_card import (
         CardState as _CardState,
+        ShowAllCardButton as _ShowAllCardButton,
         StatusCardCoalescer as _StatusCardCoalescer,
         StatusCardFrame as _StatusCardFrame,
         StatusCardView as _StatusCardView,
         StopCardButton as _StopCardButton,
+        build_status_card_history_markdown as _build_status_card_history_markdown,
+        prune_status_card_history as _prune_status_card_history,
+        status_card_history_filename as _status_card_history_filename,
+        status_card_history_rows as _status_card_history_rows,
     )
     CardState = _CardState
     StatusCardCoalescer = _StatusCardCoalescer
     StatusCardFrame = _StatusCardFrame
     StatusCardView = _StatusCardView
     StopCardButton = _StopCardButton
+    ShowAllCardButton = _ShowAllCardButton
+    build_status_card_history_markdown = _build_status_card_history_markdown
+    prune_status_card_history = _prune_status_card_history
+    status_card_history_filename = _status_card_history_filename
+    status_card_history_rows = _status_card_history_rows
 
 
 if DISCORD_AVAILABLE and all(
@@ -1103,6 +1120,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    native_task_card_full_history = True
     # Safety ceiling on split deliveries: chunks beyond the cap become a notice (degenerate turns).
     # Safety ceiling on split deliveries (#86581): a degenerate turn can produce tens of thousands of
     # characters — without a cap the adapter posts every 2000-char chunk back-to-back and floods the channel
@@ -1228,9 +1246,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._last_final_messages: OrderedDict[str, str] = OrderedDict()
         self._reaction_registry = ReactionControlRegistry()
         self._status_card_persistence_lock = asyncio.Lock()
+        self._status_card_history_lock = asyncio.Lock()
+        self._status_card_history: Dict[str, Dict[str, Any]] = {}
+        self._status_card_history_loaded = False
         self._status_card_refresh_interval = 15.0
         from hermes_constants import get_hermes_home
         self._status_card_persistence_path = get_hermes_home() / "state" / "discord_status_cards.json"
+        self._status_card_history_path = get_hermes_home() / "state" / "discord_status_card_history.json"
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -1385,7 +1407,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             self._client._hermes_discord_adapter = self
             if StopCardButton is not None and callable(getattr(self._client, "add_dynamic_items", None)):
-                self._client.add_dynamic_items(StopCardButton)
+                self._client.add_dynamic_items(StopCardButton, ShowAllCardButton)
             # Fresh connection, fresh dispatch-side silence window: the previous client's last
             # DISPATCH stamp must not leak into this connection's liveness samples (#109521).
             # READY itself is a DISPATCH event, so a healthy connection stamps almost immediately.
@@ -2232,6 +2254,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         try:
             if self.native_task_cards_enabled():
                 await self._reconcile_status_cards()
+                await self._load_status_card_history()
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
@@ -4514,7 +4537,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             view = StatusCardView(
                 frame.tasks, nonce=card.nonce, title=frame.title, state=frame.state,
                 elapsed_s=frame.elapsed_s, iteration=frame.iteration,
-                max_iterations=frame.max_iterations,
+                max_iterations=frame.max_iterations, history_nonce=frame.history_nonce,
             )
             await card.message.edit(view=view)
             return SendResult(success=True, message_id=str(card.message.id))
@@ -4572,6 +4595,70 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(atomic_json_write, path, snapshot, indent=None)
 
+    def _read_status_card_history_entries(self) -> list[dict[str, Any]]:
+        try:
+            data = json.loads(self._status_card_history_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return []
+        return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+    async def _load_status_card_history(self) -> None:
+        if self._status_card_history_loaded:
+            return
+        async with self._status_card_history_lock:
+            if self._status_card_history_loaded:
+                return
+            entries = await asyncio.to_thread(self._read_status_card_history_entries)
+            entries = prune_status_card_history(entries)
+            self._status_card_history = {
+                str(entry["nonce"]): entry for entry in entries if entry.get("nonce")
+            }
+            self._status_card_history_loaded = True
+
+    async def _record_status_card_history(self, card: CardState, finished_at: float) -> Optional[str]:
+        if len(card.tasks) <= 8:
+            return None
+        await self._load_status_card_history()
+        nonce = card.history_nonce or secrets.token_hex(16)
+        card.history_nonce = nonce
+        rows, rows_omitted = status_card_history_rows(card.tasks, card.state)
+        entry = {
+            "nonce": nonce,
+            "owner_user_id": str(card.delivery_metadata.get("owner_user_id") or ""),
+            "allowed_user_ids": sorted(
+                str(value) for value in (self._allowed_user_ids or set()) if str(value).strip()
+            ),
+            "allowed_role_ids": sorted(
+                (value for value in (self._allowed_role_ids or set()) if str(value).strip()),
+                key=str,
+            ),
+            "channel_id": card.channel_id,
+            "message_id": str(card.message.id),
+            "title": card.title,
+            "state": card.state,
+            "elapsed": card.elapsed_s,
+            "finished_at": finished_at,
+            "rows": rows,
+            "rows_omitted": rows_omitted,
+        }
+        async with self._status_card_history_lock:
+            previous = self._status_card_history.get(nonce)
+            self._status_card_history[nonce] = entry
+            snapshot = prune_status_card_history(list(self._status_card_history.values()), now=finished_at)
+            self._status_card_history = {item["nonce"]: item for item in snapshot}
+            try:
+                path = self._status_card_history_path
+                await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(atomic_json_write, path, snapshot, indent=None)
+            except Exception:
+                if previous is None:
+                    self._status_card_history.pop(nonce, None)
+                else:
+                    self._status_card_history[nonce] = previous
+                logger.warning("[Discord] Failed to persist status-card history", exc_info=True)
+                return None
+        return nonce
+
     async def _remove_status_card_persistence(self, card: CardState) -> None:
         persisted = self._status_card_persisted.pop(card.nonce, None)
         try:
@@ -4620,7 +4707,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await card.coalescer.stop(flush=False)
             card.state = outcome
             card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
+            finished_at = time.time()
+            history_nonce = await self._record_status_card_history(card, finished_at)
             frame = card.frame()
+            frame.history_nonce = history_nonce
             terminal_succeeded = False
             for attempt in range(3):
                 result = await self._edit_status_card_frame(card, frame)
@@ -4945,6 +5035,33 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return
         stopped = await controls.stop_if_current(card.session_key, card.generation)
         await interaction.followup.send("stopping" if stopped else "nothing running", ephemeral=True)
+
+    async def handle_status_card_show_all(self, interaction: Any, nonce: str) -> None:
+        await self._load_status_card_history()
+        entry = self._status_card_history.get(nonce)
+        if entry is None or not prune_status_card_history([entry]):
+            await interaction.followup.send("Detailed history expired.", ephemeral=True)
+            return
+        user = getattr(interaction, "user", None)
+        roles = getattr(user, "roles", None)
+        try:
+            member_role_ids = None if roles is None else {getattr(role, "id", None) for role in roles}
+        except TypeError:
+            member_role_ids = None
+        authorized = _discord_principal_authorized(
+            getattr(user, "id", None), member_role_ids,
+            allowed_user_ids=set(entry.get("allowed_user_ids") or []),
+            allowed_role_ids=set(entry.get("allowed_role_ids") or []),
+            require_admin=False, admin_user_ids=None,
+        )
+        if not authorized:
+            await interaction.followup.send(_unauthorized(), ephemeral=True)
+            return
+        data = build_status_card_history_markdown(entry)
+        file = discord.File(
+            io.BytesIO(data), filename=status_card_history_filename(entry["finished_at"]),
+        )
+        await interaction.followup.send(file=file, ephemeral=True)
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
