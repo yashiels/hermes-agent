@@ -303,6 +303,15 @@ try:
 except ImportError:
     from render import format_discord_message
 
+try:
+    from .reaction_controls import (
+        ReactionControlRegistry, add_approval_hint_reactions, handle_raw_reaction_add, resolve_approval_prompt,
+    )
+except ImportError:
+    from reaction_controls import (
+        ReactionControlRegistry, add_approval_hint_reactions, handle_raw_reaction_add, resolve_approval_prompt,
+    )
+
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
@@ -1215,6 +1224,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._status_message_ids: Dict[Tuple[str, str, int, str], str] = {}
         self._ended_status_runs: OrderedDict[Tuple[str, int], None] = OrderedDict()
         self._last_final_messages: OrderedDict[str, str] = OrderedDict()
+        self._reaction_registry = ReactionControlRegistry()
         self._status_card_persistence_lock = asyncio.Lock()
         from hermes_constants import get_hermes_home
         self._status_card_persistence_path = get_hermes_home() / "state" / "discord_status_cards.json"
@@ -1417,6 +1427,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             @self._client.event
             async def on_message_delete(message: DiscordMessage):
                 await adapter_self._on_platform_message_delete(message)
+
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                await handle_raw_reaction_add(adapter_self, payload)
 
             @self._client.event
             async def on_thread_create(thread):
@@ -3154,6 +3168,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+            if message_ids and self.reaction_controls_enabled():
+                run = self._hermes_run(metadata)
+                if run is not None:
+                    for sent_id in message_ids:
+                        self._reaction_registry.register_run_message(
+                            sent_id, session_key=run["session_key"],
+                            generation=run["generation"], nonce=run["nonce"],
+                        )
             # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
             # marker so the reconnect sweep can replay this final response instead of stranding it until a
             # process restart (#95382 silent partial loss).
@@ -4428,6 +4450,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def gateway_run_controls_enabled(self) -> bool:
         return self.native_task_cards_enabled() or self._extra_flag("reaction_controls")
 
+    def reaction_controls_enabled(self) -> bool:
+        return self._extra_flag("reaction_controls")
+
     def set_gateway_controls(self, controls: Any) -> None:
         self._gateway_controls = controls
 
@@ -4699,6 +4724,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             self._status_cards[key] = card
             self._status_card_keys_by_nonce[card.nonce] = key
+            if self.reaction_controls_enabled():
+                self._reaction_registry.register_run_message(
+                    str(message.id), session_key=run["session_key"],
+                    generation=run["generation"], nonce=run["nonce"],
+                )
             self._status_card_persisted[card.nonce] = {
                 "channel_id": card.channel_id,
                 "message_id": str(card.message.id),
@@ -4771,6 +4801,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         run = self._hermes_run(metadata)
         if run is None:
             return
+        self._reaction_registry.clear_run(run["session_key"], run["generation"])
         ended_key = (run["session_key"], run["generation"])
         self._ended_status_runs[ended_key] = None
         self._ended_status_runs.move_to_end(ended_key)
@@ -6066,6 +6097,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Send an approval with content as its canonical payload and an embed for state."""
         await self._set_status_card_approval(prompt.metadata, True)
+        view_holder: Dict[str, Any] = {}
 
         async def _restore_running() -> None:
             await self._set_status_card_approval(prompt.metadata, False)
@@ -6088,6 +6120,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 allow_session="session" in choices, smart_denied=prompt.smart_denied,
                 approval_state_callback=_restore_running,
             )
+            view_holder["view"] = view
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
             if mention_content:
                 allowed_mentions_cls = getattr(discord, "AllowedMentions", None)
@@ -6099,6 +6132,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         result = await self._send_prompt(prompt.chat_id, prompt.metadata, _build)
         if not result.success:
             await _restore_running()
+        elif self.reaction_controls_enabled():
+            view = view_holder.get("view")
+            message = getattr(view, "_message", None)
+            if view is not None and message is not None:
+                self._reaction_registry.register_approval(
+                    result.message_id, session_key=prompt.session_key,
+                    require_admin=view.require_admin, admin_user_ids=view.admin_user_ids,
+                    expires_at=time.time() + _read_discord_prompt_timeout(),
+                    message=message, view=view,
+                )
+                await add_approval_hint_reactions(message)
         return result
 
     async def send_slash_confirm(
@@ -6926,34 +6970,23 @@ def _define_discord_view_classes() -> None:
                 )
             return authorized
 
-        async def _resolve(self, interaction: discord.Interaction, choice: str, color: discord.Color, label_key: str):
-            """Resolve the approval via the gateway approval queue and update the embed."""
+        async def _resolve(self, interaction: discord.Interaction, choice: str):
             if not await self._gate(
                 interaction, resolved_msg=t("platform.discord.approval.already_resolved"),
                 unauth_msg=_unauthorized(),
             ):
                 return
-            label = t(label_key)
-            self.resolved = True
-            # Unblock the waiting agent thread FIRST. A click after the approval
-            # wait timed out (count == 0) must not claim "Approved".
-            try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
+            stamp = await resolve_approval_prompt(
+                self.session_key, choice, interaction.user.display_name, view=self,
+            )
+            if stamp is None:
+                await interaction.response.send_message(
+                    t("platform.discord.approval.already_resolved"), ephemeral=True,
                 )
-            except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
-                count = 0
-            if not count:
-                color = discord.Color.dark_grey()
-                label = t("platform.discord.approval.expired")
+                return
+            color, footer = stamp
             try:
-                await self._finalize_embed(
-                    interaction, color,
-                    t("platform.discord.approval.by_user", label=label, user=interaction.user.display_name) if count else label)
+                await self._finalize_embed(interaction, color, footer)
             finally:
                 if self.approval_state_callback is not None:
                     await self.approval_state_callback()
@@ -6965,22 +6998,21 @@ def _define_discord_view_classes() -> None:
                 if self.approval_state_callback is not None:
                     await self.approval_state_callback()
 
-        # Decorator labels are placeholders; ``_localize_buttons`` in __init__ sets the real text.
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._resolve(interaction, "once", discord.Color.green(), "platform.discord.approval.resolved_once")
+            await self._resolve(interaction, "once")
 
         @discord.ui.button(label="Allow Session", style=discord.ButtonStyle.grey)
         async def allow_session(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._resolve(interaction, "session", discord.Color.blue(), "platform.discord.approval.resolved_session")
+            await self._resolve(interaction, "session")
 
         @discord.ui.button(label="Always Allow", style=discord.ButtonStyle.blurple)
         async def allow_always(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._resolve(interaction, "always", discord.Color.purple(), "platform.discord.approval.resolved_always")
+            await self._resolve(interaction, "always")
 
         @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
         async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._resolve(interaction, "deny", discord.Color.red(), "platform.discord.approval.resolved_deny")
+            await self._resolve(interaction, "deny")
 
     class SlashConfirmView(_HermesView):
         """Approve Once / Always Approve / Cancel for slash-command confirmations (``/reload-mcp``,
