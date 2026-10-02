@@ -298,6 +298,11 @@ try:
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
+try:
+    from .render import render_for_discord
+except ImportError:
+    from render import render_for_discord
+
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
@@ -4364,10 +4369,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
     def format_message(self, content: str) -> str:
-        """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
+        """Format for Discord: tables become bullet lists, rules are dropped, headers collapse to h3."""
         if not content:
             return content
-        return convert_table_to_bullets(content)
+        return render_for_discord(convert_table_to_bullets(content))
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired
