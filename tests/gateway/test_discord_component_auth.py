@@ -12,7 +12,9 @@ These tests pin user/role/global allowlist semantics, explicit allow-all
 handling, and fail-closed behavior so the parity cannot regress.
 """
 
+import itertools
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -25,6 +27,7 @@ from plugins.platforms.discord.adapter import (  # noqa: E402
     SlashConfirmView,
     UpdatePromptView,
     _component_check_auth,
+    _discord_principal_authorized,
     _resolve_exec_approval_admin_gate,
 )
 
@@ -68,6 +71,79 @@ def _interaction(user_id, role_ids=None, *, drop_user=False, drop_roles=False):
     if not drop_roles:
         user_kwargs["roles"] = [SimpleNamespace(id=r) for r in (role_ids or [])]
     return SimpleNamespace(user=SimpleNamespace(**user_kwargs))
+
+
+def _legacy_principal_decision(
+    user_id, member_role_ids, *, allowed_user_ids, allowed_role_ids,
+    allow_all, paired, require_admin, admin_user_ids,
+):
+    if user_id is None:
+        return False
+    uid = str(user_id)
+    admitted = bool(allow_all)
+    user_set = {str(value) for value in allowed_user_ids}
+    if not admitted and ("*" in user_set or uid in user_set):
+        admitted = True
+    role_set = set(allowed_role_ids)
+    if not admitted and role_set:
+        if member_role_ids is None:
+            return False
+        try:
+            principal_roles = set(member_role_ids)
+        except TypeError:
+            return False
+        if principal_roles & role_set:
+            admitted = True
+    if not admitted and paired:
+        admitted = True
+    if not admitted:
+        return False
+    if not require_admin:
+        return True
+    admins = {str(value) for value in admin_user_ids}
+    admin_uid = str(user_id or "")
+    return bool(admins and admin_uid in admins)
+
+
+def test_principal_auth_matches_legacy_decision_table(monkeypatch):
+    role_data_values = (None, set(), {42}, {"42"}, {7}, 42)
+    user_policies = (set(), {"user-1"}, {"*"})
+    for (
+        user_id, member_role_ids, allowed_user_ids, roles_enabled, global_user,
+        allow_all, paired, require_admin, is_admin,
+    ) in itertools.product(
+        (None, 0, "user-1"), role_data_values, user_policies, (False, True), (False, True),
+        (False, True), (False, True), (False, True), (False, True),
+    ):
+        if allow_all:
+            monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+        else:
+            monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+        if global_user:
+            monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "user-1")
+        else:
+            monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+        allowed_roles = {42} if roles_enabled else set()
+        admins = {"user-1"} if is_admin else set()
+        combined_users = set(allowed_user_ids) | ({"user-1"} if global_user else set())
+        store = MagicMock()
+        store.is_approved.return_value = paired
+        expected = _legacy_principal_decision(
+            user_id, member_role_ids,
+            allowed_user_ids=combined_users, allowed_role_ids=allowed_roles,
+            allow_all=allow_all, paired=paired, require_admin=require_admin,
+            admin_user_ids=admins,
+        )
+        with patch("gateway.pairing.PairingStore", return_value=store):
+            actual = _discord_principal_authorized(
+                user_id, member_role_ids,
+                allowed_user_ids=allowed_user_ids, allowed_role_ids=allowed_roles,
+                require_admin=require_admin, admin_user_ids=admins,
+            )
+        assert actual is expected, (
+            user_id, member_role_ids, allowed_user_ids, roles_enabled, global_user,
+            allow_all, paired, require_admin, is_admin,
+        )
 
 
 # ── no policy configured -> deny unless allow-all is explicit ──────────────
@@ -288,4 +364,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-

@@ -1366,6 +1366,15 @@ class GatewayAdapterLifecycleMixin:
         self, adapter: Any, chat_id: str, message_id: str, *, session_key: str,
         metadata: Optional[Dict[str, Any]],
     ) -> None:
+        capability = getattr(adapter, "gateway_run_controls_enabled", None)
+        if not callable(capability):
+            return
+        try:
+            if capability() is not True:
+                return
+        except Exception:
+            logger.warning("Adapter run-control capability check failed", exc_info=True)
+            return
         last_messages = getattr(self, "_last_final_message_ids", None)
         if last_messages is None:
             from collections import OrderedDict

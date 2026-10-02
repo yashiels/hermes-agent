@@ -4344,7 +4344,12 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
-        if result.success and result.message_id and self.gateway_runner is not None:
+        if (
+            result.success
+            and result.message_id
+            and self.gateway_runner is not None
+            and self._gateway_run_controls_enabled(delivery_adapter)
+        ):
             await self.gateway_runner._record_final_message(
                 delivery_adapter, event.source.chat_id, str(result.message_id),
                 session_key=session_key, metadata=metadata,
@@ -4357,7 +4362,7 @@ class BasePlatformAdapter(ABC):
         metadata: Optional[Dict[str, Any]], delivery_attempted: bool, delivery_succeeded: bool,
     ) -> None:
         hermes_run = getattr(event, "_hermes_run", None)
-        if not isinstance(hermes_run, dict):
+        if not isinstance(hermes_run, dict) or not self._gateway_run_controls_enabled(self):
             return
         hook_metadata = dict(metadata or {})
         hook_metadata["hermes_run"] = dict(hermes_run)
@@ -4388,6 +4393,17 @@ class BasePlatformAdapter(ABC):
                     await result
             except Exception:
                 logger.warning("[%s] Turn-end hook failed", self.name, exc_info=True)
+
+    @staticmethod
+    def _gateway_run_controls_enabled(adapter: Any) -> bool:
+        enabled = getattr(adapter, "gateway_run_controls_enabled", None)
+        if not callable(enabled):
+            return False
+        try:
+            return enabled() is True
+        except Exception:
+            logger.warning("Adapter run-control capability check failed", exc_info=True)
+            return False
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4642,7 +4658,8 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
-            event._hermes_turn_outcome = "failed"
+            if isinstance(getattr(event, "_hermes_run", None), dict):
+                event._hermes_turn_outcome = "failed"
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata

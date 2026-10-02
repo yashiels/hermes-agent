@@ -14,13 +14,17 @@ from gateway.session import SessionSource
 
 
 class HookAdapter(BasePlatformAdapter):
-    def __init__(self, send_success=True):
+    def __init__(self, send_success=True, controls_enabled=True):
         super().__init__(
             PlatformConfig(enabled=True, token="x", typing_indicator=False),
             Platform.DISCORD,
         )
         self.send_success = send_success
+        self.controls_enabled = controls_enabled
         self.hooks = []
+
+    def gateway_run_controls_enabled(self):
+        return self.controls_enabled
 
     async def connect(self, *, is_reconnect=False):
         return True
@@ -73,6 +77,38 @@ async def test_run_token_propagates_to_progress_and_status_metadata():
     assert status_metadata["hermes_run"] == token
     assert turn_ctx._progress_metadata["hermes_run"] is not token
     assert status_metadata["hermes_run"] is not token
+
+
+@pytest.mark.asyncio
+async def test_flag_off_has_no_run_token_or_turn_hooks():
+    adapter = HookAdapter(controls_enabled=False)
+    runner = SimpleNamespace(
+        _delivery_adapter_for=lambda _source: adapter,
+        _run_agent_progress_threading=lambda *_args: ({}, None, {}),
+        hooks=object(),
+    )
+    callback = lambda *_args: None
+    turn_runner = SimpleNamespace(
+        _step_callback_sync=callback,
+        _event_callback_sync=callback,
+        _status_callback_sync=callback,
+    )
+    turn_ctx = SimpleNamespace()
+    source = SessionSource(platform=Platform.DISCORD, chat_id="1", chat_type="dm")
+
+    token = GatewayTurnMixin._new_adapter_run_token(runner, source, "session-1", 1)
+    status_metadata = GatewayTurnMixin._run_agent_bind_turn_wiring(
+        runner, turn_ctx, turn_runner, source, None, False, token,
+    )
+    event = MessageEvent(text="hello", source=source)
+    await adapter._run_gateway_turn_end_hooks(
+        event, "session-1", asyncio.Event(), status_metadata, False, False,
+    )
+
+    assert token is None
+    assert "hermes_run" not in turn_ctx._progress_metadata
+    assert "hermes_run" not in status_metadata
+    assert adapter.hooks == []
 
 
 def test_generic_native_card_gate_accepts_discord_and_keeps_explicit_off():
@@ -171,7 +207,10 @@ async def test_final_message_recording_precedes_adapter_hook():
     async def on_final_message(chat_id, message_id, *, metadata):
         seen.append((chat_id, message_id, metadata))
 
-    adapter = SimpleNamespace(on_final_message=on_final_message)
+    adapter = SimpleNamespace(
+        on_final_message=on_final_message,
+        gateway_run_controls_enabled=lambda: True,
+    )
     runner = SimpleNamespace()
     metadata = {"hermes_run": {"session_key": "session-1", "generation": 1, "nonce": "a" * 16}}
 

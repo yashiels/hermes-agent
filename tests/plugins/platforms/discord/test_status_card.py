@@ -117,20 +117,24 @@ class FakeMessage:
 
 
 class FakeChannel:
-    def __init__(self, message=None):
+    def __init__(self, message=None, *, new_message_each_send=False):
         self.message = message or FakeMessage()
+        self.messages = [self.message]
         self.sends = []
         self.failure = None
+        self.new_message_each_send = new_message_each_send
 
     async def send(self, **kwargs):
         self.sends.append(kwargs)
         if self.failure is not None:
             raise self.failure
+        if self.new_message_each_send and len(self.sends) > 1:
+            self.message = FakeMessage(str(99 + len(self.sends)))
+            self.messages.append(self.message)
         return self.message
 
     def get_partial_message(self, message_id):
-        assert str(message_id) == str(self.message.id)
-        return self.message
+        return next(message for message in self.messages if str(message.id) == str(message_id))
 
 
 def run_metadata(generation=1, nonce="0123456789abcdef", session_key="session-1", thread_id="thread-1"):
@@ -176,6 +180,14 @@ def test_status_card_view_trims_text_and_components():
     assert any("+4 earlier" in text for text in view_texts(view))
 
 
+def test_run_control_capability_follows_native_or_reaction_flag(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch, enabled=False)
+
+    assert adapter.gateway_run_controls_enabled() is False
+    adapter.config.extra["reaction_controls"] = True
+    assert adapter.gateway_run_controls_enabled() is True
+
+
 @pytest.mark.asyncio
 async def test_status_card_send_uses_only_components_view(tmp_path, monkeypatch):
     adapter, channel = make_adapter(tmp_path, monkeypatch)
@@ -192,13 +204,15 @@ async def test_status_card_send_uses_only_components_view(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_old_finalize_cannot_pop_new_card(tmp_path, monkeypatch):
-    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    channel = FakeChannel(new_message_each_send=True)
+    adapter, _channel = make_adapter(tmp_path, monkeypatch, channel=channel)
     old = run_metadata(generation=1, nonce="1111111111111111")
     new = run_metadata(generation=2, nonce="2222222222222222")
 
     await adapter.send_native_task_card_progress(
         "channel-1", [{"id": "1", "title": "Old", "status": "running"}], metadata=old,
     )
+    old_message = channel.message
     await adapter.send_native_task_card_progress(
         "channel-1", [{"id": "2", "title": "New", "status": "running"}], metadata=new,
     )
@@ -208,8 +222,9 @@ async def test_old_finalize_cannot_pop_new_card(tmp_path, monkeypatch):
     ) is False
     key = adapter._status_card_keys_by_nonce["2222222222222222"]
     assert adapter._status_cards[key].nonce == "2222222222222222"
+    assert "interrupted" in view_texts(old_message.edits[-1]["view"])[1]
     persisted = json.loads(adapter._status_card_persistence_path.read_text())
-    assert {entry["nonce"] for entry in persisted} == {"1111111111111111", "2222222222222222"}
+    assert {entry["nonce"] for entry in persisted} == {"2222222222222222"}
 
 
 @pytest.mark.asyncio
@@ -284,9 +299,25 @@ async def test_terminal_edit_failure_removes_controls_and_sends_notice(tmp_path,
 
     assert await adapter.finalize_native_task_card(
         "channel-1", outcome="failed", reply_to=None, metadata=metadata,
-    ) is False
+    ) is True
     assert channel.message.edits[-1] == {"view": None}
     assert "status card could not be updated" in adapter.send.await_args.args[1]
+    assert json.loads(adapter._status_card_persistence_path.read_text()) == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_edit_and_notice_failure_keep_persistence(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    channel.message.failures = [DiscordFailure("server", status=500) for _ in range(4)]
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline", retryable=True))
+
+    assert await adapter.finalize_native_task_card(
+        "channel-1", outcome="failed", reply_to=None, metadata=metadata,
+    ) is False
     assert json.loads(adapter._status_card_persistence_path.read_text())
 
 
@@ -332,6 +363,61 @@ async def test_components_v2_validation_failure_falls_back_to_text(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_delayed_permanent_edit_failure_disables_card_and_sends_fallback(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}],
+        metadata=metadata, fallback_text="Inspect · running",
+    )
+    card = next(iter(adapter._status_cards.values()))
+    card.coalescer._interval = 0.02
+    card.coalescer._last_edit = time.monotonic()
+    channel.message.failures = [DiscordFailure("forbidden", status=403)]
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-1"))
+
+    result = await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}],
+        metadata=metadata, fallback_text="Inspect · running",
+    )
+    await asyncio.sleep(0.05)
+
+    assert result.success is True
+    assert not adapter._status_cards
+    adapter.send.assert_awaited_once_with(
+        "channel-1", "Inspect · running", metadata=metadata,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delayed_unknown_edit_failure_retries_on_next_frame(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    card = next(iter(adapter._status_cards.values()))
+    card.coalescer._interval = 0.02
+    card.coalescer._last_edit = time.monotonic()
+    channel.message.failures = [ConnectionError("offline")]
+    adapter.send = AsyncMock()
+
+    first = await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    await asyncio.sleep(0.05)
+    second = await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "completed"}], metadata=metadata,
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert adapter._status_cards
+    adapter.send.assert_not_awaited()
+    assert len(channel.message.edits) == 2
+
+
+@pytest.mark.asyncio
 async def test_restart_reconciliation_edits_and_removes_leftover(tmp_path, monkeypatch):
     adapter, channel = make_adapter(tmp_path, monkeypatch)
     path = adapter._status_card_persistence_path
@@ -346,6 +432,44 @@ async def test_restart_reconciliation_edits_and_removes_leftover(tmp_path, monke
     await adapter._reconcile_status_cards()
 
     assert "gateway restarted" in view_texts(channel.message.edits[-1]["view"])[1]
+    assert json.loads(path.read_text()) == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reconciliation_skips_live_card(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    channel.message.edits.clear()
+
+    await adapter._reconcile_status_cards()
+
+    assert channel.message.edits == []
+    assert adapter._status_cards
+    assert json.loads(adapter._status_card_persistence_path.read_text())
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failures_accumulate_across_connects(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    path = adapter._status_card_persistence_path
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps([{
+        "channel_id": "thread-1",
+        "message_id": "100",
+        "nonce": "0123456789abcdef",
+        "started_at": time.time() - 10,
+        "reconcile_attempts": 0,
+    }]))
+    channel.message.failures = [ConnectionError("offline") for _ in range(3)]
+
+    await adapter._reconcile_status_cards()
+    assert json.loads(path.read_text())[0]["reconcile_attempts"] == 1
+    await adapter._reconcile_status_cards()
+    assert json.loads(path.read_text())[0]["reconcile_attempts"] == 2
+    await adapter._reconcile_status_cards()
     assert json.loads(path.read_text()) == []
 
 

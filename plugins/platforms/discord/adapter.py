@@ -4418,9 +4418,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Format for Discord: tables become bullet lists, rules are dropped, headers collapse to h3."""
         return format_discord_message(content)
 
-    def native_task_cards_enabled(self) -> bool:
-        value = (self.config.extra or {}).get("native_task_cards", False)
+    def _extra_flag(self, key: str) -> bool:
+        value = (self.config.extra or {}).get(key, False)
         return value if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def native_task_cards_enabled(self) -> bool:
+        return self._extra_flag("native_task_cards")
+
+    def gateway_run_controls_enabled(self) -> bool:
+        return self.native_task_cards_enabled() or self._extra_flag("reaction_controls")
 
     def set_gateway_controls(self, controls: Any) -> None:
         self._gateway_controls = controls
@@ -4467,10 +4473,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except (TypeError, ValueError):
             status = None
         permanent = code == 50035 or status in {400, 403, 404}
-        transient = status is not None and 500 <= status < 600
         return SendResult(
             success=False, error=str(exc), raw_response=exc,
-            retryable=bool(transient and not permanent),
+            retryable=not permanent,
         )
 
     async def _edit_status_card_frame(self, card: CardState, frame: StatusCardFrame) -> SendResult:
@@ -4483,10 +4488,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await card.message.edit(view=view)
             return SendResult(success=True, message_id=str(card.message.id))
         except Exception as exc:
-            result = self._status_card_error_result(exc)
-            if not result.retryable:
-                await self._compare_pop_status_card(card)
-            return result
+            return self._status_card_error_result(exc)
 
     async def _compare_pop_status_card(self, card: CardState) -> bool:
         key = (card.chat_id, card.thread_key)
@@ -4504,6 +4506,82 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(atomic_json_write, path, snapshot, indent=None)
 
+    async def _disable_status_card_after_permanent_failure(
+        self, card: CardState, *, send_fallback: bool,
+    ) -> None:
+        if not await self._compare_pop_status_card(card):
+            return
+        if not send_fallback or card.fallback_sent:
+            card.fallback_sent = True
+            return
+        card.fallback_sent = True
+        text = card.fallback_text.strip()
+        if not text:
+            last_task = card.tasks[-1] if card.tasks else {}
+            title = str(last_task.get("title") or last_task.get("id") or "run")
+            text = f"-# {title} · progress card unavailable"
+        try:
+            await self.send(card.chat_id, text, metadata=dict(card.delivery_metadata))
+        except Exception:
+            logger.warning("[Discord] Status-card text fallback failed", exc_info=True)
+
+    async def _handle_status_card_coalescer_failure(
+        self, card: CardState, result: SendResult,
+    ) -> None:
+        if result.retryable:
+            return
+        await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
+
+    async def _terminalize_status_card(
+        self, card: CardState, *, outcome: str, metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        async with card.lock:
+            if card.terminal_completed:
+                return True
+            if card.coalescer is not None:
+                await card.coalescer.stop(flush=False)
+            card.state = outcome
+            card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
+            frame = card.frame()
+            terminal_succeeded = False
+            for attempt in range(3):
+                result = await self._edit_status_card_frame(card, frame)
+                if result.success:
+                    terminal_succeeded = True
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (2 ** attempt))
+            notice_succeeded = False
+            if not terminal_succeeded:
+                try:
+                    await card.message.edit(view=None)
+                except Exception:
+                    pass
+                notice_metadata = dict(card.delivery_metadata)
+                notice_metadata.update(metadata or {})
+                if card.thread_key:
+                    notice_metadata["thread_id"] = card.thread_key
+                try:
+                    notice = await self.send(
+                        card.chat_id, f"-# run {outcome} · status card could not be updated",
+                        metadata=notice_metadata,
+                    )
+                    notice_succeeded = bool(notice.success)
+                except Exception:
+                    logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
+            completed = terminal_succeeded or notice_succeeded
+            await self._compare_pop_status_card(card)
+            if completed:
+                persisted = self._status_card_persisted.pop(card.nonce, None)
+                try:
+                    await self._persist_status_cards()
+                except Exception:
+                    if persisted is not None:
+                        self._status_card_persisted[card.nonce] = persisted
+                    raise
+                card.terminal_completed = True
+            return completed
+
     def _read_status_card_entries(self) -> list[dict[str, Any]]:
         try:
             data = json.loads(self._status_card_persistence_path.read_text(encoding="utf-8-sig"))
@@ -4519,32 +4597,45 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if entry.get("nonce")
         })
         for entry in entries:
+            nonce = str(entry.get("nonce") or "")
+            if nonce in self._status_card_keys_by_nonce:
+                continue
             channel_id = str(entry.get("channel_id") or "")
             message_id = str(entry.get("message_id") or "")
             if not channel_id or not message_id:
+                self._status_card_persisted.pop(nonce, None)
                 continue
-            for attempt in range(3):
+            try:
+                channel = await self._resolve_channel(channel_id)
+                if channel is None:
+                    raise RuntimeError(f"Channel {channel_id} not found")
+                message = channel.get_partial_message(int(message_id))
+                view = StatusCardView(
+                    [], nonce=None, title="Hermes run", state="interrupted-restart",
+                    elapsed_s=max(0.0, time.time() - float(entry.get("started_at") or time.time())),
+                    iteration=0, max_iterations=0,
+                )
+                await message.edit(view=view)
+                self._status_card_persisted.pop(nonce, None)
+            except Exception as exc:
                 try:
-                    channel = await self._resolve_channel(channel_id)
-                    if channel is None:
-                        raise RuntimeError(f"Channel {channel_id} not found")
-                    message = channel.get_partial_message(int(message_id))
-                    view = StatusCardView(
-                        [], nonce=None, title="Hermes run", state="interrupted-restart",
-                        elapsed_s=max(0.0, time.time() - float(entry.get("started_at") or time.time())),
-                        iteration=0, max_iterations=0,
+                    attempts = max(0, int(entry.get("reconcile_attempts") or 0)) + 1
+                except (TypeError, ValueError):
+                    attempts = 1
+                if attempts >= 3:
+                    self._status_card_persisted.pop(nonce, None)
+                    logger.warning(
+                        "[Discord] Dropping status card %s/%s after 3 reconciliation failures: %s",
+                        channel_id, message_id, exc,
                     )
-                    await message.edit(view=view)
-                    break
-                except Exception as exc:
-                    if attempt < 2:
-                        await asyncio.sleep(0.25 * (2 ** attempt))
-                    else:
-                        logger.warning(
-                            "[Discord] Failed to reconcile status card %s/%s after 3 attempts: %s",
-                            channel_id, message_id, exc,
-                        )
-            self._status_card_persisted.pop(str(entry.get("nonce") or ""), None)
+                else:
+                    retained = dict(entry)
+                    retained["reconcile_attempts"] = attempts
+                    self._status_card_persisted[nonce] = retained
+                    logger.warning(
+                        "[Discord] Status-card reconciliation attempt %d/3 failed for %s/%s: %s",
+                        attempts, channel_id, message_id, exc,
+                    )
         await self._persist_status_cards()
 
     def native_task_card_destination_supported(
@@ -4566,9 +4657,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         key = self._status_card_key(chat_id, metadata)
         card = self._status_cards.get(key)
         if card is not None and card.nonce != run["nonce"]:
-            if card.coalescer is not None:
-                await card.coalescer.stop(flush=False)
-            await self._compare_pop_status_card(card)
+            await self._terminalize_status_card(
+                card, outcome="interrupted", metadata=card.delivery_metadata,
+            )
             card = None
         if card is None:
             try:
@@ -4588,8 +4679,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 session_key=run["session_key"], chat_id=key[0], thread_key=key[1],
                 channel_id=channel_id, message=message, tasks=[dict(task) for task in tasks],
                 state="running", started_at=time.time(), title=title or "Hermes run",
+                fallback_text=str(fallback_text or ""), delivery_metadata=dict(metadata or {}),
             )
-            card.coalescer = StatusCardCoalescer(lambda frame: self._edit_status_card_frame(card, frame))
+            card.coalescer = StatusCardCoalescer(
+                lambda frame: self._edit_status_card_frame(card, frame),
+                on_failure=lambda result: self._handle_status_card_coalescer_failure(card, result),
+            )
             self._status_cards[key] = card
             self._status_card_keys_by_nonce[card.nonce] = key
             self._status_card_persisted[card.nonce] = {
@@ -4597,14 +4692,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "message_id": str(card.message.id),
                 "nonce": card.nonce,
                 "started_at": card.started_at,
+                "reconcile_attempts": 0,
             }
             await self._persist_status_cards()
             return SendResult(success=True, message_id=str(message.id))
         card.tasks = [dict(task) for task in tasks]
         card.title = title or card.title
+        card.fallback_text = str(fallback_text or card.fallback_text)
+        card.delivery_metadata = dict(metadata or card.delivery_metadata)
         if card.state != "waiting-approval":
             card.state = "running"
-        return await card.coalescer.submit(card.frame())
+        result = await card.coalescer.submit(card.frame())
+        if not result.success and not result.retryable:
+            await self._disable_status_card_after_permanent_failure(card, send_fallback=False)
+        return result
 
     async def stop_native_task_card_progress(
         self, chat_id: str, *, reply_to: Optional[str] = None,
@@ -4635,6 +4736,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         card.iteration = max(0, int(iteration))
         card.max_iterations = max(0, int(max_iterations))
         result = await card.coalescer.submit(card.frame())
+        if not result.success and not result.retryable:
+            await self._disable_status_card_after_permanent_failure(card, send_fallback=False)
         return bool(result.success)
 
     async def finalize_native_task_card(
@@ -4648,37 +4751,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         card = self._status_cards.get(key) if key is not None else None
         if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
             return False
-        terminal_succeeded = False
-        async with card.lock:
-            if card.coalescer is not None:
-                await card.coalescer.stop(flush=False)
-            card.state = outcome
-            card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
-            frame = card.frame()
-            for attempt in range(3):
-                result = await self._edit_status_card_frame(card, frame)
-                if result.success:
-                    terminal_succeeded = True
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(0.25 * (2 ** attempt))
-            if not terminal_succeeded:
-                try:
-                    await card.message.edit(view=None)
-                except Exception:
-                    pass
-                notice_metadata = dict(metadata or {})
-                if card.thread_key:
-                    notice_metadata["thread_id"] = card.thread_key
-                await self.send(
-                    chat_id, f"-# run {outcome} · status card could not be updated",
-                    metadata=notice_metadata,
-                )
-            await self._compare_pop_status_card(card)
-        if terminal_succeeded:
-            self._status_card_persisted.pop(card.nonce, None)
-            await self._persist_status_cards()
-        return terminal_succeeded
+        return await self._terminalize_status_card(card, outcome=outcome, metadata=metadata)
 
     async def on_turn_end(
         self, chat_id: str, *, metadata: Optional[Dict[str, Any]], outcome: str,
@@ -4713,7 +4786,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
             return
         card.state = "waiting-approval" if waiting else "running"
-        await card.coalescer.submit(card.frame())
+        result = await card.coalescer.submit(card.frame())
+        if not result.success and not result.retryable:
+            await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *,
@@ -6636,9 +6711,9 @@ def _discord_principal_authorized(
     user_id: Any, member_role_ids: Optional[set], *, allowed_user_ids: Optional[set],
     allowed_role_ids: Optional[set], require_admin: bool, admin_user_ids: Optional[set],
 ) -> bool:
-    uid = str(user_id or "").strip()
-    if not uid:
+    if user_id is None:
         return False
+    uid = str(user_id)
     if _scoped_gate_env("DISCORD_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:
         admitted = True
     elif _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}:
@@ -6650,10 +6725,15 @@ def _discord_principal_authorized(
     user_set.update(global_allowed)
     if "*" in user_set or uid in user_set:
         admitted = True
-    role_set = {str(role).strip() for role in (allowed_role_ids or set()) if str(role).strip()}
-    if role_set and member_role_ids is not None:
-        principal_roles = {str(role).strip() for role in member_role_ids if str(role).strip()}
-        admitted = admitted or bool(principal_roles & role_set)
+    role_set = set(allowed_role_ids or set())
+    if not admitted and role_set:
+        if member_role_ids is None:
+            return False
+        try:
+            principal_roles = set(member_role_ids)
+        except TypeError:
+            return False
+        admitted = bool(principal_roles & role_set)
     if not admitted:
         try:
             from gateway.pairing import PairingStore
@@ -6667,7 +6747,8 @@ def _discord_principal_authorized(
     if not require_admin:
         return True
     admins = {str(admin).strip() for admin in (admin_user_ids or set()) if str(admin).strip()}
-    return bool(admins and uid in admins)
+    admin_uid = str(user_id or "")
+    return bool(admins and admin_uid in admins)
 
 
 def _component_check_auth(

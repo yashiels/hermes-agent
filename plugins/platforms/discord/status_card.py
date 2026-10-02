@@ -148,9 +148,12 @@ class StatusCardFrame:
 
 class StatusCardCoalescer:
     def __init__(
-        self, edit: Callable[[StatusCardFrame], Awaitable[SendResult]], *, interval: float = 1.5,
+        self, edit: Callable[[StatusCardFrame], Awaitable[SendResult]], *,
+        on_failure: Optional[Callable[[SendResult], Awaitable[None]]] = None,
+        interval: float = 1.5,
     ):
         self._edit = edit
+        self._on_failure = on_failure
         self._interval = interval
         self._latest: Optional[StatusCardFrame] = None
         self._task: Optional[asyncio.Task] = None
@@ -185,6 +188,8 @@ class StatusCardCoalescer:
                 result = await self._edit(frame)
                 if result.success:
                     self._last_edit = time.monotonic()
+                elif self._on_failure is not None:
+                    await self._on_failure(result)
         except asyncio.CancelledError:
             raise
         finally:
@@ -228,6 +233,10 @@ class CardState:
     elapsed_s: float = 0.0
     iteration: int = 0
     max_iterations: int = 0
+    fallback_text: str = ""
+    delivery_metadata: dict[str, Any] = field(default_factory=dict)
+    fallback_sent: bool = False
+    terminal_completed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     coalescer: Optional[StatusCardCoalescer] = None
 

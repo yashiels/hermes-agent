@@ -2193,13 +2193,10 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
-            hermes_run = {
-                "session_key": session_key,
-                "generation": int(run_generation),
-                "nonce": secrets.token_hex(8),
-            }
-            event._hermes_run = hermes_run
-            event._hermes_turn_outcome = "failed"
+            hermes_run = self._new_adapter_run_token(_turn_source, session_key, run_generation)
+            if hermes_run is not None:
+                event._hermes_run = hermes_run
+                event._hermes_turn_outcome = "failed"
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2218,14 +2215,15 @@ class GatewayTurnMixin:
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
                 hermes_run=hermes_run,
             )
-            event._hermes_turn_outcome = (
-                "interrupted"
-                if not self._is_session_run_current(_quick_key, run_generation)
-                or bool(isinstance(agent_result, dict) and agent_result.get("interrupted"))
-                else "failed"
-                if bool(isinstance(agent_result, dict) and agent_result.get("failed"))
-                else "done"
-            )
+            if hermes_run is not None:
+                event._hermes_turn_outcome = (
+                    "interrupted"
+                    if not self._is_session_run_current(_quick_key, run_generation)
+                    or bool(isinstance(agent_result, dict) and agent_result.get("interrupted"))
+                    else "failed"
+                    if bool(isinstance(agent_result, dict) and agent_result.get("failed"))
+                    else "done"
+                )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -4106,6 +4104,7 @@ class GatewayTurnMixin:
             and getattr(_sc, "message_id", None) != "__no_edit__"
             and getattr(_sc, "adapter", None) is not None
             and session_key
+            and isinstance((turn_ctx._status_thread_metadata or {}).get("hermes_run"), dict)
         ):
             await self._record_final_message(
                 _sc.adapter, source.chat_id, str(_sc.message_id), session_key=session_key,
@@ -4386,3 +4385,24 @@ class GatewayTurnMixin:
         except Exception:
             logger.debug("Native task-card config check failed", exc_info=True)
             return False
+
+    def _new_adapter_run_token(
+        self, source: SessionSource, session_key: Optional[str], run_generation: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        adapter = self._delivery_adapter_for(source)
+        enabled = getattr(adapter, "gateway_run_controls_enabled", None)
+        if not callable(enabled):
+            return None
+        try:
+            if enabled() is not True:
+                return None
+        except Exception:
+            logger.warning("Adapter run-control capability check failed", exc_info=True)
+            return None
+        if not session_key or run_generation is None:
+            return None
+        return {
+            "session_key": session_key,
+            "generation": int(run_generation),
+            "nonce": secrets.token_hex(8),
+        }
