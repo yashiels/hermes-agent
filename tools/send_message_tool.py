@@ -711,6 +711,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         sender, err = _plugin_standalone_sender(platform_name)
         return err or await sender(pconfig, chat_id, message, thread_id=thread_id, media_files=media_files,
                                    force_document=force_document, **_optional_sender_kwargs(sender, notify=notify))
+    if platform_name == "discord":
+        from plugins.platforms.discord.render import format_discord_message
+        message = format_discord_message(message)
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
