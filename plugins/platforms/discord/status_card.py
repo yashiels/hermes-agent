@@ -193,7 +193,8 @@ def _truncate_utf8(data: bytes, limit: int) -> bytes:
 def build_status_card_history_markdown(
     entry: dict[str, Any], *, max_bytes: int = _HISTORY_FILE_MAX_BYTES,
 ) -> bytes:
-    title = _compact_task_title(_sanitize_history_text(entry.get("title") or "Hermes run"))
+    terminal_title = _TERMINAL_TITLES.get(str(entry.get("state") or ""), "").strip("*")
+    title = terminal_title or _compact_task_title(_sanitize_history_text(entry.get("title") or "Hermes run"))
     try:
         rows_omitted = max(0, int(entry.get("rows_omitted") or 0))
     except (TypeError, ValueError):

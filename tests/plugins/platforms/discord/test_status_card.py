@@ -911,7 +911,7 @@ async def test_show_all_sends_utf8_markdown_with_header_and_rows(tmp_path, monke
     await ShowAllCardButton(nonce).callback(interaction)
 
     text = captured["data"].decode("utf-8")
-    assert text.startswith("# Hermes run")
+    assert text.startswith("# Failed")
     assert "- State: failed" in text
     assert "- Elapsed:" in text
     assert "- Finished:" in text
@@ -1194,3 +1194,9 @@ async def test_history_persistence_uses_atomic_write(tmp_path, monkeypatch):
     assert "persisted-secret" not in "\n".join(stored["rows"])
     assert "token=[REDACTED]" in stored["rows"][0]
     assert "interaction_token" not in stored
+
+
+def test_history_markdown_heading_uses_terminal_title():
+    from plugins.platforms.discord.status_card import build_status_card_history_markdown
+    entry = {"title": "Hermes is working", "state": "done", "elapsed": 39, "finished_at": 1790969132.0, "rows": []}
+    assert build_status_card_history_markdown(entry).decode("utf-8").startswith("# Done\n")
