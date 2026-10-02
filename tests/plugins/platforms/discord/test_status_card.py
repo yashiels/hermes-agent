@@ -228,7 +228,7 @@ async def test_old_finalize_cannot_pop_new_card(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_supersession_keeps_old_persistence_and_creates_replacement(
+async def test_failed_supersession_keeps_old_card_and_aborts_replacement(
     tmp_path, monkeypatch, caplog,
 ):
     channel = FakeChannel(new_message_each_send=True)
@@ -245,11 +245,13 @@ async def test_failed_supersession_keeps_old_persistence_and_creates_replacement
         "channel-1", [{"id": "2", "title": "New", "status": "running"}], metadata=new,
     )
 
-    assert result.success is True
-    key = adapter._status_card_keys_by_nonce["2222222222222222"]
-    assert adapter._status_cards[key].nonce == "2222222222222222"
+    assert result == SendResult(success=False, error="superseded card not terminalized")
+    key = adapter._status_card_keys_by_nonce["1111111111111111"]
+    assert adapter._status_cards[key].nonce == "1111111111111111"
+    assert "2222222222222222" not in adapter._status_card_keys_by_nonce
+    assert len(channel.sends) == 1
     persisted = json.loads(adapter._status_card_persistence_path.read_text())
-    assert {entry["nonce"] for entry in persisted} == {"1111111111111111", "2222222222222222"}
+    assert {entry["nonce"] for entry in persisted} == {"1111111111111111"}
     assert "restart reconciliation will retry" in caplog.text
 
 

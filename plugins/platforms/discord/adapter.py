@@ -4582,8 +4582,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 except Exception:
                     logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
             completed = terminal_succeeded or controls_removed or notice_succeeded
-            await self._compare_pop_status_card(card)
             if completed:
+                await self._compare_pop_status_card(card)
                 await self._remove_status_card_persistence(card)
                 card.terminal_completed = True
             return completed
@@ -4671,6 +4671,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     "[Discord] Superseded status card %s could not be terminalized; restart reconciliation will retry",
                     card.nonce,
                 )
+                return SendResult(success=False, error="superseded card not terminalized")
             card = None
         if card is None:
             try:
