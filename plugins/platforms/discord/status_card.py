@@ -20,6 +20,12 @@ _STATE_LABELS = {
     "interrupted": "interrupted",
     "interrupted-restart": "interrupted (gateway restarted)",
 }
+_TERMINAL_TITLES = {
+    "done": "**Done**",
+    "failed": "**Failed**",
+    "interrupted": "**Stopped**",
+    "interrupted-restart": "**Interrupted**",
+}
 _STATE_COLOURS = {
     "running": 0x5865F2,
     "waiting-approval": 0xF0B232,
@@ -78,7 +84,7 @@ def render_status_card_texts(
     tasks: list[dict[str, str]], *, title: str, state: str, elapsed_s: float,
     iteration: int, max_iterations: int,
 ) -> list[str]:
-    texts = [str(title or "Hermes run"), _meta_text(state, elapsed_s, iteration, max_iterations)]
+    texts = [_TERMINAL_TITLES.get(state) or str(title or "Hermes run"), _meta_text(state, elapsed_s, iteration, max_iterations)]
     remaining = _DISPLAY_LIMIT - sum(len(text) for text in texts)
     for line in _task_texts(tasks):
         if remaining <= 0:

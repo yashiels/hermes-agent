@@ -665,3 +665,13 @@ def test_card_frame_elapsed_tracks_wall_clock(monkeypatch):
     card.iteration, card.max_iterations, card.started_at = 0, 0, 1000.0
     monkeypatch.setattr(status_card.time, "time", lambda: 1095.0)
     assert status_card.CardState.frame(card).elapsed_s == 95.0
+
+
+def test_terminal_states_replace_the_running_title():
+    from plugins.platforms.discord.status_card import render_status_card_texts
+    kwargs = {"tasks": [], "title": "Hermes is working", "elapsed_s": 5, "iteration": 0, "max_iterations": 0}
+    assert render_status_card_texts(state="running", **kwargs)[0] == "Hermes is working"
+    assert render_status_card_texts(state="done", **kwargs)[0] == "**Done**"
+    assert render_status_card_texts(state="failed", **kwargs)[0] == "**Failed**"
+    assert render_status_card_texts(state="interrupted", **kwargs)[0] == "**Stopped**"
+    assert render_status_card_texts(state="interrupted-restart", **kwargs)[0] == "**Interrupted**"
