@@ -4577,6 +4577,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         or card.coalescer is None
                     ):
                         return
+                    card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
                     result = await card.coalescer.submit(card.frame())
                 if not result.success and not result.retryable:
                     await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
@@ -4621,7 +4622,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         await self._load_status_card_history()
         nonce = card.history_nonce or secrets.token_hex(16)
         card.history_nonce = nonce
-        rows, rows_omitted = status_card_history_rows(card.tasks, card.state)
+        rows, rows_omitted = status_card_history_rows(
+            card.tasks, card.state,
+            earlier_rows_omitted=card.delivery_metadata.get("status_card_rows_omitted", 0),
+        )
         entry = {
             "nonce": nonce,
             "owner_user_id": str(card.delivery_metadata.get("owner_user_id") or ""),
@@ -5048,12 +5052,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             member_role_ids = None if roles is None else {getattr(role, "id", None) for role in roles}
         except TypeError:
             member_role_ids = None
-        authorized = _discord_principal_authorized(
-            getattr(user, "id", None), member_role_ids,
-            allowed_user_ids=set(entry.get("allowed_user_ids") or []),
-            allowed_role_ids=set(entry.get("allowed_role_ids") or []),
+        current_allowed_users = set(self._allowed_user_ids or set())
+        current_allowed_roles = set(self._allowed_role_ids or set())
+        user_id = getattr(user, "id", None)
+        current_authorized = bool(current_allowed_users or current_allowed_roles) and _discord_principal_authorized(
+            user_id, member_role_ids,
+            allowed_user_ids=current_allowed_users,
+            allowed_role_ids=current_allowed_roles,
             require_admin=False, admin_user_ids=None,
         )
+        owner_user_id = str(entry.get("owner_user_id") or "")
+        owner_authorized = bool(owner_user_id and str(user_id) == owner_user_id and current_authorized)
+        authorized = current_authorized or owner_authorized
         if not authorized:
             await interaction.followup.send(_unauthorized(), ephemeral=True)
             return

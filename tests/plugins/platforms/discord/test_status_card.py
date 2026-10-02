@@ -260,7 +260,7 @@ async def test_discord_task_card_publish_keeps_all_rows_for_terminal_history():
     )
     runner = TurnRunner(None, context)
     state = runner._TaskCardState(adapter)
-    for index in range(9):
+    for index in range(350):
         state.apply_event({
             "type": "tool.started", "tool_call_id": str(index), "tool_name": f"tool-{index}",
         })
@@ -268,8 +268,24 @@ async def test_discord_task_card_publish_keeps_all_rows_for_terminal_history():
     await runner._task_card_publish(state)
 
     sent_tasks = adapter.send_native_task_card_progress.await_args.kwargs["tasks"]
-    assert len(sent_tasks) == 9
+    sent_metadata = adapter.send_native_task_card_progress.await_args.kwargs["metadata"]
+    assert len(sent_tasks) == 300
+    assert sent_tasks[0]["title"] == "tool-50"
+    assert sent_metadata["status_card_rows_omitted"] == 50
     assert len(state.visible_tasks()) == 8
+    rows, rows_omitted = status_card_history_rows(
+        sent_tasks, "done", earlier_rows_omitted=sent_metadata["status_card_rows_omitted"],
+    )
+    history_file = build_status_card_history_markdown({
+        "title": "Hermes run",
+        "state": "done",
+        "elapsed": 1,
+        "finished_at": 2_000_000_000.0,
+        "rows": rows,
+        "rows_omitted": rows_omitted,
+    }).decode("utf-8")
+    assert rows_omitted == 50
+    assert "50 earlier rows omitted" in history_file
 
 
 @pytest.mark.asyncio
@@ -385,6 +401,47 @@ async def test_elapsed_refresh_task_is_cancelled_on_terminal(tmp_path, monkeypat
     ) is True
     assert card.refresh_task is None
     assert refresh_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_elapsed_refreshes_advance_card_state_and_rendered_time(tmp_path, monkeypatch):
+    import plugins.platforms.discord.adapter as discord_adapter
+
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
+    )
+    card = next(iter(adapter._status_cards.values()))
+    await adapter._stop_status_card_refresh(card)
+    card.started_at = 100.0
+    card.elapsed_s = 0.0
+    elapsed_frames = []
+
+    async def submit(frame):
+        elapsed_frames.append(frame.elapsed_s)
+        return await adapter._edit_status_card_frame(card, frame)
+
+    card.coalescer = SimpleNamespace(submit=submit)
+    clock = [100.0]
+
+    async def advance(_delay):
+        clock[0] += 15.0
+        if clock[0] > 130.0:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(discord_adapter.time, "time", lambda: clock[0])
+    monkeypatch.setattr(discord_adapter.asyncio, "sleep", advance)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._refresh_status_card(card)
+
+    assert elapsed_frames == [15.0, 30.0]
+    assert card.elapsed_s == 30.0
+    assert [view_texts(edit["view"])[1] for edit in channel.message.edits[-2:]] == [
+        "-# running · 15s",
+        "-# running · 30s",
+    ]
 
 
 @pytest.mark.asyncio
@@ -760,6 +817,55 @@ async def test_show_all_rejects_unauthorized_principal(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_show_all_uses_current_acl_after_owner_revocation(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    adapter._allowed_user_ids = {"7"}
+    metadata = run_metadata()
+    metadata["owner_user_id"] = "7"
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    await adapter.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
+    await adapter.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    )
+    nonce = next(iter(adapter._status_card_history))
+    adapter._allowed_user_ids = {"42"}
+    former_owner = show_all_interaction(adapter, user_id=7)
+    current_principal = show_all_interaction(adapter, user_id=42)
+
+    with patch("gateway.pairing.PairingStore") as store:
+        store.return_value.is_approved.return_value = False
+        await ShowAllCardButton(nonce).callback(former_owner)
+        await ShowAllCardButton(nonce).callback(current_principal)
+
+    assert "allowed list" in former_owner.followup.send.await_args.args[0].lower()
+    assert "file" in current_principal.followup.send.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_show_all_empty_current_acl_fails_closed_for_owner(tmp_path, monkeypatch):
+    adapter, _channel = make_adapter(tmp_path, monkeypatch)
+    adapter._allowed_user_ids = {"7"}
+    metadata = run_metadata()
+    metadata["owner_user_id"] = "7"
+    tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    await adapter.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
+    await adapter.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    )
+    nonce = next(iter(adapter._status_card_history))
+    adapter._allowed_user_ids = set()
+    adapter._allowed_role_ids = set()
+    interaction = show_all_interaction(adapter, user_id=7)
+
+    with patch("gateway.pairing.PairingStore") as store:
+        store.return_value.is_approved.return_value = True
+        await ShowAllCardButton(nonce).callback(interaction)
+
+    assert "allowed list" in interaction.followup.send.await_args.args[0].lower()
+    assert "file" not in interaction.followup.send.await_args.kwargs
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("expired", [False, True])
 async def test_show_all_reports_missing_or_expired_history(tmp_path, monkeypatch, expired):
     adapter, _channel = make_adapter(tmp_path, monkeypatch)
@@ -829,6 +935,7 @@ async def test_fresh_adapter_loads_history_and_serves_show_all(tmp_path, monkeyp
     nonce = next(iter(first._status_card_history))
 
     fresh, _fresh_channel = make_adapter(tmp_path, monkeypatch)
+    fresh._allowed_user_ids = {"7"}
     captured = {}
 
     def make_file(stream, *, filename):
@@ -973,8 +1080,52 @@ def test_history_rows_redact_secrets_strip_queries_and_keep_compaction():
     assert joined.count("[REDACTED]") >= 6
     assert "liveSecretValue" not in joined
     assert "token=secret" not in joined
-    assert "https://example.com/path#section" in joined
+    assert "https://example.com/path" in joined
+    assert "section" not in joined
     assert all(len(row) <= 122 for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("raw", "forbidden", "expected"),
+    [
+        ("github_pat_11AA22BB33CC44DD55EE", ["11AA22BB"], "[REDACTED]"),
+        ("gho_abcdefghijklmnopqrstuvwxyz", ["abcdefghijklmnopqrstuvwxyz"], "[REDACTED]"),
+        ("ghu_abcdefghijklmnopqrstuvwxyz", ["abcdefghijklmnopqrstuvwxyz"], "[REDACTED]"),
+        ("ghs_abcdefghijklmnopqrstuvwxyz", ["abcdefghijklmnopqrstuvwxyz"], "[REDACTED]"),
+        ("ghr_abcdefghijklmnopqrstuvwxyz", ["abcdefghijklmnopqrstuvwxyz"], "[REDACTED]"),
+        ("AKIA1234567890ABCDEF", ["AKIA1234567890ABCDEF"], "[REDACTED]"),
+        ("ASIA1234567890ABCDEF", ["ASIA1234567890ABCDEF"], "[REDACTED]"),
+        ("aws_secret=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcd", ["ABCDEFGHIJKLMNOPQRSTUVWXYZ"], "aws_secret=[REDACTED]"),
+        ("token=live-token", ["live-token"], "token=[REDACTED]"),
+        ("API_KEY=live-api-key", ["live-api-key"], "API_KEY=[REDACTED]"),
+        ("apikey=live-apikey", ["live-apikey"], "apikey=[REDACTED]"),
+        ("secret=live-secret", ["live-secret"], "secret=[REDACTED]"),
+        ("password=live-password", ["live-password"], "password=[REDACTED]"),
+        ("passwd=live-passwd", ["live-passwd"], "passwd=[REDACTED]"),
+        ("auth=live-auth", ["live-auth"], "auth=[REDACTED]"),
+        (
+            "https://alice:live-password@example.com/path",
+            ["alice", "live-password"],
+            "https://[REDACTED]@example.com/path",
+        ),
+        (
+            "https://example.com/path?token=live#private",
+            ["token=live", "private"],
+            "https://example.com/path",
+        ),
+        (
+            "https://discord.com/api/webhooks/123456/live-webhook-token",
+            ["123456", "live-webhook-token"],
+            "https://discord.com/api/webhooks/[REDACTED]",
+        ),
+    ],
+)
+def test_history_redaction_patterns(raw, forbidden, expected):
+    rows, omitted = status_card_history_rows([{"title": raw, "status": "complete"}], "done")
+
+    assert omitted == 0
+    assert expected in rows[0]
+    assert all(secret not in rows[0] for secret in forbidden)
 
 
 def test_history_pruning_enforces_age_card_and_row_bounds():
@@ -996,6 +1147,7 @@ def test_history_pruning_enforces_age_card_and_row_bounds():
     assert pruned[0]["nonce"] == "recent-1"
     assert pruned[-1]["nonce"] == "recent-200"
     assert all(len(entry["rows"]) == 300 for entry in pruned)
+    assert all(entry["rows_omitted"] == 1 for entry in pruned)
 
 
 def test_history_markdown_stays_below_cap_with_truncation_notice():
@@ -1005,11 +1157,13 @@ def test_history_markdown_stays_below_cap_with_truncation_notice():
         "elapsed": 12,
         "finished_at": 2_000_000_000.0,
         "rows": ["✓ " + "界" * 120 for _ in range(300)],
+        "rows_omitted": 50,
     }
 
     data = build_status_card_history_markdown(entry, max_bytes=512)
 
     assert len(data) < 512
+    assert "50 earlier rows omitted" in data.decode("utf-8")
     assert "Detailed history truncated." in data.decode("utf-8")
 
 
@@ -1018,7 +1172,9 @@ async def test_history_persistence_uses_atomic_write(tmp_path, monkeypatch):
     adapter, _channel = make_adapter(tmp_path, monkeypatch)
     metadata = run_metadata()
     metadata["owner_user_id"] = "7"
+    metadata["status_card_rows_omitted"] = 50
     tasks = [{"title": f"Task {index}", "status": "complete"} for index in range(9)]
+    tasks[0]["title"] = "terminal token=persisted-secret"
 
     with patch("plugins.platforms.discord.adapter.atomic_json_write") as atomic_write:
         await adapter.send_native_task_card_progress("channel-1", tasks, metadata=metadata)
@@ -1034,4 +1190,7 @@ async def test_history_persistence_uses_atomic_write(tmp_path, monkeypatch):
     stored = history_calls[0].args[1][0]
     assert stored["owner_user_id"] == "7"
     assert len(stored["rows"]) == 9
+    assert stored["rows_omitted"] == 50
+    assert "persisted-secret" not in "\n".join(stored["rows"])
+    assert "token=[REDACTED]" in stored["rows"][0]
     assert "interaction_token" not in stored

@@ -56,12 +56,24 @@ _TERMINAL_ACTIVE_MARKERS = {
     "interrupted": "⏹",
     "interrupted-restart": "⏹",
 }
-_URL_QUERY_RE = re.compile(r"(https?://[^\s?#]+)\?[^\s#]*(#[^\s]*)?", re.IGNORECASE)
+_URL_USERINFO_RE = re.compile(r"(https?://)[^/\s@]+@", re.IGNORECASE)
+_URL_SUFFIX_RE = re.compile(r"(https?://[^\s?#]+)(?:\?[^\s#]*)?(?:#[^\s]*)?", re.IGNORECASE)
+_DISCORD_WEBHOOK_RE = re.compile(r"/api/webhooks/[^/\s]+/[^\s?#]+", re.IGNORECASE)
+_KEY_VALUE_SECRET_RE = re.compile(
+    r"\b(token|api_key|apikey|secret|password|passwd|auth)(\s*=\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)",
+    re.IGNORECASE,
+)
+_AWS_SECRET_RE = re.compile(
+    r"\b(aws_secret)(\s*[:=]?\s*)([A-Za-z0-9/+=_-]{40})(?![A-Za-z0-9/+=_-])",
+    re.IGNORECASE,
+)
 _SECRET_PATTERNS = (
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_-]+", re.IGNORECASE),
-    re.compile(r"\bghp_[A-Za-z0-9_-]+", re.IGNORECASE),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_-]+", re.IGNORECASE),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_-]+", re.IGNORECASE),
     re.compile(r"\bxox[A-Za-z0-9_-]+", re.IGNORECASE),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
     re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32,}(?![0-9A-Fa-f])"),
     re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/=])"),
 )
@@ -116,20 +128,29 @@ def _task_texts(tasks: list[dict[str, str]], state: str) -> list[str]:
 
 
 def _sanitize_history_text(value: Any) -> str:
-    text = _URL_QUERY_RE.sub(lambda match: (match.group(1) or "") + (match.group(2) or ""), str(value or ""))
+    text = str(value or "")
+    text = _DISCORD_WEBHOOK_RE.sub("/api/webhooks/[REDACTED]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
+    text = _URL_SUFFIX_RE.sub(r"\1", text)
+    text = _KEY_VALUE_SECRET_RE.sub(r"\1\2[REDACTED]", text)
+    text = _AWS_SECRET_RE.sub(r"\1\2[REDACTED]", text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text
 
 
 def status_card_history_rows(
-    tasks: list[dict[str, str]], state: str,
+    tasks: list[dict[str, str]], state: str, *, earlier_rows_omitted: int = 0,
 ) -> tuple[list[str], int]:
     rows = [
         f"{_task_marker(task, state)} {_compact_task_title(_sanitize_history_text(task.get('title') or task.get('id') or 'Task'))}"
         for task in tasks
     ]
-    omitted = max(0, len(rows) - _HISTORY_ROW_LIMIT)
+    try:
+        upstream_omitted = max(0, int(earlier_rows_omitted))
+    except (TypeError, ValueError):
+        upstream_omitted = 0
+    omitted = upstream_omitted + max(0, len(rows) - _HISTORY_ROW_LIMIT)
     return rows[-_HISTORY_ROW_LIMIT:], omitted
 
 
@@ -145,7 +166,12 @@ def prune_status_card_history(entries: list[dict[str, Any]], *, now: Optional[fl
             continue
         bounded = dict(entry)
         rows = bounded.get("rows")
+        rows_trimmed = max(0, len(rows) - _HISTORY_ROW_LIMIT) if isinstance(rows, list) else 0
         bounded["rows"] = [str(row) for row in rows[-_HISTORY_ROW_LIMIT:]] if isinstance(rows, list) else []
+        try:
+            bounded["rows_omitted"] = max(0, int(bounded.get("rows_omitted") or 0)) + rows_trimmed
+        except (TypeError, ValueError):
+            bounded["rows_omitted"] = rows_trimmed
         kept.append(bounded)
     kept.sort(key=lambda entry: float(entry["finished_at"]))
     return kept[-_HISTORY_CARD_LIMIT:]
@@ -168,11 +194,17 @@ def build_status_card_history_markdown(
     entry: dict[str, Any], *, max_bytes: int = _HISTORY_FILE_MAX_BYTES,
 ) -> bytes:
     title = _compact_task_title(_sanitize_history_text(entry.get("title") or "Hermes run"))
+    try:
+        rows_omitted = max(0, int(entry.get("rows_omitted") or 0))
+    except (TypeError, ValueError):
+        rows_omitted = 0
+    omitted_text = f"- {rows_omitted} earlier rows omitted\n" if rows_omitted else ""
     header = (
         f"# {title}\n\n"
         f"- State: {entry.get('state') or 'unknown'}\n"
         f"- Elapsed: {_elapsed_text(float(entry.get('elapsed') or 0.0))}\n"
-        f"- Finished: {status_card_history_finished_text(entry.get('finished_at'))}\n\n"
+        f"- Finished: {status_card_history_finished_text(entry.get('finished_at'))}\n"
+        f"{omitted_text}\n"
         "## Steps\n"
     ).encode("utf-8")
     notice = _HISTORY_TRUNCATION_NOTICE.encode("utf-8")
@@ -189,8 +221,6 @@ def build_status_card_history_markdown(
             truncated = True
             break
         output.extend(line)
-    if entry.get("rows_omitted"):
-        truncated = True
     if truncated:
         output.extend(notice)
     return bytes(output)

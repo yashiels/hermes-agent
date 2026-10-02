@@ -122,12 +122,15 @@ async def resolve_approval_prompt(
 
 
 def finalize_approval_view(view: Any, message: Any, color: Any, footer: str) -> Any:
-    view.resolved = True
     embed = message.embeds[0] if getattr(message, "embeds", None) else None
     if embed is not None:
         embed.color = color
         embed.set_footer(text=footer)
-    view._disable_all()
+    if view is not None:
+        view.resolved = True
+        disable_all = getattr(view, "_disable_all", None)
+        if callable(disable_all):
+            disable_all()
     return embed
 
 

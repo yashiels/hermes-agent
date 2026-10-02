@@ -16,6 +16,7 @@ from plugins.platforms.discord.reaction_controls import (
     EMOJI_STOP,
     ReactionControlRegistry,
     add_approval_hint_reactions,
+    finalize_approval_view,
     handle_raw_reaction_add,
     resolve_approval_prompt,
 )
@@ -50,6 +51,16 @@ class FakeView:
     def _disable_all(self):
         for child in self.children:
             child.disabled = True
+
+
+def test_finalize_approval_view_allows_missing_view():
+    message = FakeMessage()
+
+    embed = finalize_approval_view(None, message, 7, "resolved")
+
+    assert embed is message.embeds[0]
+    assert embed.color == 7
+    assert embed.footer == "resolved"
 
 
 class FakeAdapter:
