@@ -576,6 +576,36 @@ async def test_components_v2_validation_failure_falls_back_to_text(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_retryable_initial_publish_preserves_native_card_lane(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    channel.failure = ConnectionError("offline")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-1"))
+    context = SimpleNamespace(
+        source=SimpleNamespace(chat_id="channel-1"),
+        _progress_reply_to=None,
+        _progress_metadata=run_metadata(),
+        _cleanup_progress=False,
+        _cleanup_msg_ids=[],
+        tool_progress_enabled=True,
+    )
+    runner = TurnRunner(None, context)
+    state = runner._TaskCardState(adapter)
+    state.apply_event({
+        "type": "tool.started", "tool_call_id": "call-1", "tool_name": "terminal",
+    })
+
+    await runner._task_card_publish(state)
+
+    assert state.native_failed is False
+    adapter.send.assert_not_awaited()
+    channel.failure = None
+    await runner._task_card_publish(state)
+    assert adapter._status_cards
+    adapter.send.assert_not_awaited()
+    await adapter._stop_status_card_refresh(next(iter(adapter._status_cards.values())))
+
+
+@pytest.mark.asyncio
 async def test_delayed_permanent_edit_failure_disables_card_and_sends_fallback(tmp_path, monkeypatch):
     adapter, channel = make_adapter(tmp_path, monkeypatch)
     metadata = run_metadata()

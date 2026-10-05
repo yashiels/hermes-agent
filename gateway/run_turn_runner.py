@@ -468,6 +468,15 @@ class TurnRunner:
                     "of this turn (the destination is not approved)"
                 )
                 return
+            if (
+                getattr(result, "retryable", False)
+                and getattr(st.adapter, "native_task_card_retryable_failures_preserve_lane", False)
+            ):
+                logger.warning(
+                    "Native task-card progress failed transiently; preserving the native lane for retry: %s",
+                    getattr(result, "error", "unknown error"),
+                )
+                return
             st.native_failed = True
             if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
                 self._task_card_uncardable_destination(st, getattr(result, "error", "unknown error"))
