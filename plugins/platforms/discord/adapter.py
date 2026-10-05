@@ -1121,6 +1121,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     native_task_card_full_history = True
+    native_task_card_retryable_failures_preserve_lane = True
     # Safety ceiling on split deliveries: chunks beyond the cap become a notice (degenerate turns).
     # Safety ceiling on split deliveries (#86581): a degenerate turn can produce tens of thousands of
     # characters — without a cap the adapter posts every 2000-char chunk back-to-back and floods the channel
