@@ -493,6 +493,15 @@ class GatewayTurnProgressMixin:
                     "of this turn (the destination is not approved)"
                 )
                 return
+            if (
+                getattr(result, "retryable", False)
+                and getattr(st.adapter, "native_task_card_retryable_failures_preserve_lane", False)
+            ):
+                logger.warning(
+                    "Native task-card progress failed transiently; preserving the native lane for retry: %s",
+                    getattr(result, "error", "unknown error"),
+                )
+                return
             st.native_failed = True
             from gateway.run_turn_runner import _CARD_DESTINATION_REFUSALS
             if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
