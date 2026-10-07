@@ -82,7 +82,7 @@ async def _send_followup(interaction: discord.Interaction, text: str) -> None:
     try:
         await interaction.followup.send(text, ephemeral=True)
     except Exception as e:
-        logger.debug("[Discord] Could not send context-menu followup: %s", e)
+        logger.debug("[Discord] Could not send context-menu followup: %s", e, exc_info=True)
 
 
 async def _dispatch(adapter: Any, interaction: discord.Interaction, text: str) -> None:
@@ -239,7 +239,7 @@ def register_context_menus(adapter: Any, tree: Any) -> int:
         try:
             tree.add_command(menu)
         except Exception as e:
-            logger.warning("[Discord] Failed to register context menu %r: %s", name, e)
+            logger.warning("[Discord] Failed to register context menu %r: %s", name, e, exc_info=True)
             continue
         registered += 1
     return registered

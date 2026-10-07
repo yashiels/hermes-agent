@@ -20,6 +20,7 @@ import weakref
 from abc import ABC, abstractmethod
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import safe_url_for_log
+from gateway.platforms.base_run_controls import PlatformRunControlsMixin
 
 from utils import normalize_proxy_url
 from agent.i18n import t
@@ -1853,7 +1854,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -4368,13 +4369,6 @@ class BasePlatformAdapter(ABC):
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
 
-    async def _release_turn_marker(self, event: MessageEvent) -> None:
-        """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or
-        nothing more is owed (no kill leaves a persisted reply with neither), then wake the drain. Idempotent."""
-        if (getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None)
-                and self.gateway_runner is not None):
-            await self.gateway_runner._clear_durable_active_turn(event)
-        getattr(event, "_gateway_marker_released", asyncio.Event()).set()
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
@@ -4397,75 +4391,8 @@ class BasePlatformAdapter(ABC):
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
-    async def _run_gateway_turn_end_hooks(
-        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
-        metadata: Optional[dict[str, Any]], delivery_attempted: bool, delivery_succeeded: bool,
-    ) -> None:
-        hermes_run = getattr(event, "_hermes_run", None)
-        if not isinstance(hermes_run, dict) or not self._gateway_run_controls_enabled(self):
-            return
-        hook_metadata = dict(metadata or {})
-        hook_metadata["hermes_run"] = dict(hermes_run)
-        preliminary = getattr(event, "_hermes_turn_outcome", "failed")
-        outcome = (
-            "interrupted"
-            if interrupt_event.is_set() or preliminary == "interrupted"
-            else "failed"
-            if preliminary == "failed" or (delivery_attempted and not delivery_succeeded)
-            else "done"
-        )
-        finalize = getattr(self, "finalize_native_task_card", None)
-        if callable(finalize):
-            try:
-                result = finalize(
-                    event.source.chat_id, outcome=outcome,
-                    reply_to=_reply_anchor_for_event(event), metadata=hook_metadata,
-                )
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                logger.warning("[%s] Native task-card finalization failed", self.name, exc_info=True)
-        turn_end = getattr(self, "on_turn_end", None)
-        if callable(turn_end):
-            try:
-                result = turn_end(event.source.chat_id, metadata=hook_metadata, outcome=outcome)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                logger.warning("[%s] Turn-end hook failed", self.name, exc_info=True)
 
-    @staticmethod
-    def _gateway_run_controls_enabled(adapter: Any) -> bool:
-        enabled = getattr(adapter, "gateway_run_controls_enabled", None)
-        if not callable(enabled):
-            return False
-        try:
-            return enabled() is True
-        except Exception:
-            logger.warning("Adapter run-control capability check failed", exc_info=True)
-            return False
 
-    async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
-        """Tell the user a turn failed rather than leaving radio silence (last resort:
-        a failing notice is logged, never raised). Returns the thread metadata used."""
-        _thread_metadata = None
-        try:
-            _thread_metadata = _thread_metadata_for_event(event)
-            error_detail = str(e)[:300] if str(e) else t("gateway.notify.turn_error_no_details")
-            # Only the policy reads bind the routed profile; the send stays in the launch scope
-            # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
-            with self._media_delivery_scope(event.source):
-                content = None if diagnostic_wake_muted(event) else self.warning_text(
-                    t("gateway.notify.turn_error_detailed", error_type=type(e).__name__, error_detail=error_detail),
-                    t("gateway.notify.turn_error"),
-                    logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
-            if content is None:
-                return _thread_metadata
-            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
-        except Exception as notify_err:
-            logger.error(
-                "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
-        return _thread_metadata
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: _ExtractedResponse,
                                    metadata: dict[str, Any], *, anything_sent: bool,

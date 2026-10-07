@@ -4648,6 +4648,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             await card.message.edit(view=view)
             return SendResult(success=True, message_id=str(card.message.id))
         except Exception as exc:
+            logger.debug("[Discord] Status-card transport failed", exc_info=True)
             return self._status_card_error_result(exc)
 
     async def _compare_pop_status_card(self, card: CardState) -> bool:
@@ -4783,27 +4784,39 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     async def _disable_status_card_after_permanent_failure(
         self, card: CardState, *, send_fallback: bool, result: Optional[SendResult] = None,
     ) -> None:
-        logger.warning(
-            "[Discord] Disabling status card %s after permanent lifecycle failure: %s",
-            card.nonce, getattr(result, "error", None) or "unknown failure",
-        )
-        await self._stop_status_card_refresh(card)
-        if not await self._compare_pop_status_card(card):
-            return
-        await self._remove_status_card_persistence(card)
-        if not send_fallback or card.fallback_sent:
-            card.fallback_sent = True
-            return
-        card.fallback_sent = True
-        text = card.fallback_text.strip()
-        if not text:
-            last_task = card.tasks[-1] if card.tasks else {}
-            title = str(last_task.get("title") or last_task.get("id") or "run")
-            text = f"-# {title} · progress card unavailable"
-        try:
-            await self.send(card.chat_id, text, metadata=dict(card.delivery_metadata))
-        except Exception:
-            logger.warning("[Discord] Status-card text fallback failed", exc_info=True)
+        async with card.lock:
+            if card.terminal_completed or card.terminalizing:
+                return
+            card.terminalizing = True
+            try:
+                logger.warning(
+                    "[Discord] Disabling status card %s after permanent lifecycle failure: %s",
+                    card.nonce, getattr(result, "error", None) or "unknown failure",
+                )
+                await self._stop_status_card_refresh(card)
+                if card.coalescer is not None:
+                    await card.coalescer.close()
+                if not await self._compare_pop_status_card(card):
+                    card.terminal_completed = True
+                    return
+                await self._remove_status_card_persistence(card)
+                if not send_fallback or card.fallback_sent:
+                    card.fallback_sent = True
+                    card.terminal_completed = True
+                    return
+                card.fallback_sent = True
+                text = card.fallback_text.strip()
+                if not text:
+                    last_task = card.tasks[-1] if card.tasks else {}
+                    title = str(last_task.get("title") or last_task.get("id") or "run")
+                    text = f"-# {title} · progress card unavailable"
+                try:
+                    await self.send(card.chat_id, text, metadata=dict(card.delivery_metadata))
+                except Exception:
+                    logger.warning("[Discord] Status-card text fallback failed", exc_info=True)
+                card.terminal_completed = True
+            finally:
+                card.terminalizing = False
 
     async def _handle_status_card_coalescer_failure(
         self, card: CardState, result: SendResult,
@@ -4852,7 +4865,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     except Exception as exc:
                         logger.warning(
                             "[Discord] Status-card control removal failed for %s: %s",
-                            card.nonce, exc,
+                            card.nonce, exc, exc_info=True,
                         )
                     notice_metadata = dict(card.delivery_metadata)
                     notice_metadata.update(metadata or {})
@@ -4923,7 +4936,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 self._status_card_persisted.pop(nonce, None)
                 logger.warning(
                     "[Discord] Dropping status card %s/%s after 3 reconciliation failures: %s",
-                    channel_id, message_id, exc,
+                    channel_id, message_id, exc, exc_info=True,
                 )
             else:
                 retained = dict(entry)
@@ -4931,7 +4944,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 self._status_card_persisted[nonce] = retained
                 logger.warning(
                     "[Discord] Status-card reconciliation attempt %d/3 failed for %s/%s: %s",
-                    attempts, channel_id, message_id, exc,
+                    attempts, channel_id, message_id, exc, exc_info=True,
                 )
 
     async def _sweep_orphaned_status_cards(self, ended_nonce: str) -> None:
@@ -5015,6 +5028,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 )
                 message = await channel.send(view=view)
             except Exception as exc:
+                logger.debug("[Discord] Status-card transport failed", exc_info=True)
                 return self._status_card_error_result(exc)
             card = CardState(
                 nonce=run["nonce"], generation=run["generation"],
@@ -5415,7 +5429,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         try:
             registered = register_context_menus(self, tree)
         except Exception as e:
-            logger.warning("[%s] Failed to register Discord context menus: %s", self.name, e)
+            logger.warning("[%s] Failed to register Discord context menus: %s", self.name, e, exc_info=True)
             return
         logger.info("[%s] Registered %d Discord message context menu(s)", self.name, registered)
 

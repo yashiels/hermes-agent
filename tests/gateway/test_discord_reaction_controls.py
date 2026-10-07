@@ -88,7 +88,7 @@ async def test_connect_registers_raw_reaction_handler(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="t", extra={"reaction_controls": True}))
     adapter._slash_commands = False
     monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda *a, **k: (True, None))
-    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda *a, **k: None)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_scoped_lock", lambda *a, **k: None)
     intents = SimpleNamespace(
         message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False,
     )

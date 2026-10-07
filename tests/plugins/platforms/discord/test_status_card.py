@@ -282,7 +282,7 @@ async def test_status_card_survives_progress_cleanup_before_final_delivery(
 
     async def send(chat_id, content, reply_to=None, metadata=None):
         if content == "final answer":
-            await asyncio.sleep(0.04)
+            await asyncio.sleep(0)
             sent.append(("answer", content))
             final_sent.set()
             return SendResult(success=True, message_id="final-1")
@@ -326,7 +326,7 @@ async def test_status_card_survives_progress_cleanup_before_final_delivery(
     adapter.set_message_handler(handler)
     adapter._active_sessions[session_key] = asyncio.Event()
     await asyncio.wait_for(adapter._process_message_background(opening, session_key), timeout=2.0)
-    await asyncio.sleep(0.06)
+    assert final_sent.is_set()
 
     final_view = channel.message.edits[-1]["view"]
     assert (
@@ -510,8 +510,9 @@ async def test_coalescer_cancellation_drops_throttled_frame():
 
     await coalescer.submit(first)
     await coalescer.submit(second)
+    pending = coalescer._task
     await coalescer.close()
-    await asyncio.sleep(0.07)
+    assert pending.done()
 
     assert edits == ["running"]
 
@@ -533,17 +534,116 @@ async def test_coalescer_flush_resumes_with_interval_and_close_drops_frames():
     await coalescer.submit(waiting)
     await coalescer.flush()
     await coalescer.submit(resumed)
-    await asyncio.sleep(0.02)
     assert edits == ["running", "waiting-approval"]
-    await asyncio.sleep(0.05)
+    await wait_until(lambda: len(edits) == 3)
     assert edits == ["running", "waiting-approval", "running"]
     await coalescer.submit(waiting)
+    pending = coalescer._task
     await coalescer.close()
     result = await coalescer.submit(running)
-    await asyncio.sleep(0.06)
+    assert pending.done()
     assert result.success is True
     assert result.error == "status card closed"
     assert edits == ["running", "waiting-approval", "running"]
+
+
+@pytest.mark.asyncio
+async def test_coalescer_close_from_failure_callback_does_not_self_await():
+    edits = []
+    closed = asyncio.Event()
+    coalescer = None
+
+    async def edit(frame):
+        edits.append(frame.state)
+        if len(edits) == 1:
+            return SendResult(success=True)
+        return SendResult(success=False, error="forbidden", retryable=False)
+
+    async def on_failure(_result):
+        await coalescer.close()
+        closed.set()
+
+    coalescer = StatusCardCoalescer(edit, on_failure=on_failure, interval=0.01)
+    await coalescer.submit(StatusCardFrame([], "Run", "running", 0, 0, 0))
+    await coalescer.submit(StatusCardFrame([], "Run", "waiting-approval", 0, 0, 0))
+
+    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    result = await coalescer.submit(StatusCardFrame([], "Run", "running", 1, 0, 0))
+
+    assert edits == ["running", "waiting-approval"]
+    assert result.success is True
+    assert result.error == "status card closed"
+
+
+@pytest.mark.asyncio
+async def test_submit_during_flush_uses_flush_edit_time_for_interval():
+    interval = 0.05
+    edit_times = []
+    edit_started = asyncio.Event()
+    release_edit = asyncio.Event()
+
+    async def edit(_frame):
+        edit_times.append(time.monotonic())
+        if len(edit_times) == 1:
+            edit_started.set()
+            await release_edit.wait()
+        return SendResult(success=True)
+
+    coalescer = StatusCardCoalescer(edit, interval=interval)
+    coalescer._last_edit = time.monotonic()
+    await coalescer.submit(StatusCardFrame([], "Run", "running", 0, 0, 0))
+    flush_task = asyncio.create_task(coalescer.flush())
+    await asyncio.wait_for(edit_started.wait(), timeout=0.2)
+    submit_task = asyncio.create_task(
+        coalescer.submit(StatusCardFrame([], "Run", "waiting-approval", 0, 0, 0))
+    )
+    await asyncio.sleep(0)
+    assert submit_task.done() is False
+    release_edit.set()
+    await flush_task
+    await submit_task
+    await wait_until(lambda: len(edit_times) == 2)
+
+    assert edit_times[1] - edit_times[0] >= interval
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_racing_finalize_tears_down_once(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}],
+        metadata=metadata, fallback_text="Inspect · running",
+    )
+    card = next(iter(adapter._status_cards.values()))
+    await adapter._stop_status_card_refresh(card)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-1"))
+    failure = SendResult(success=False, error="forbidden", retryable=False)
+
+    async with card.lock:
+        failure_task = asyncio.create_task(
+            adapter._disable_status_card_after_permanent_failure(
+                card, send_fallback=True, result=failure,
+            )
+        )
+        await asyncio.sleep(0)
+        finalize_task = asyncio.create_task(
+            adapter.finalize_native_task_card(
+                "channel-1", outcome="done", reply_to=None, metadata=metadata,
+            )
+        )
+        await asyncio.sleep(0)
+
+    await failure_task
+    assert await finalize_task is True
+    closed = await card.coalescer.submit(card.frame())
+
+    assert channel.message.edits == []
+    adapter.send.assert_awaited_once_with("channel-1", "Inspect · running", metadata=metadata)
+    assert closed.success is True
+    assert closed.error == "status card closed"
+    assert card.terminal_completed is True
+    assert not adapter._status_cards
 
 
 @pytest.mark.asyncio
@@ -632,7 +732,7 @@ async def test_terminal_edit_wins_over_delayed_frame(tmp_path, monkeypatch):
     assert await adapter.finalize_native_task_card(
         "channel-1", outcome="done", reply_to=None, metadata=metadata,
     ) is True
-    await asyncio.sleep(0.07)
+    assert card.coalescer._task is None
 
     assert "done" in view_texts(channel.message.edits[-1]["view"])[1]
 
@@ -648,7 +748,7 @@ async def test_elapsed_refresh_task_is_cancelled_on_terminal(tmp_path, monkeypat
     card = next(iter(adapter._status_cards.values()))
     card.started_at -= 16
     refresh_task = card.refresh_task
-    await asyncio.sleep(0.03)
+    await wait_until(lambda: bool(channel.message.edits))
 
     assert any("16s" in text or "17s" in text for text in view_texts(channel.message.edits[-1]["view"]))
     assert await adapter.finalize_native_task_card(
@@ -707,13 +807,15 @@ async def test_elapsed_refresh_does_not_edit_after_terminal(tmp_path, monkeypatc
     await adapter.send_native_task_card_progress(
         "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
     )
-    await asyncio.sleep(0.02)
+    await wait_until(lambda: bool(channel.message.edits))
+    card = next(iter(adapter._status_cards.values()))
+    refresh_task = card.refresh_task
     assert await adapter.finalize_native_task_card(
         "channel-1", outcome="interrupted", reply_to=None, metadata=metadata,
     ) is True
     terminal_edit_count = len(channel.message.edits)
 
-    await asyncio.sleep(0.03)
+    assert refresh_task.done()
 
     assert len(channel.message.edits) == terminal_edit_count
     assert "interrupted" in view_texts(channel.message.edits[-1]["view"])[1]
@@ -878,7 +980,7 @@ async def test_delayed_permanent_edit_failure_disables_card_and_sends_fallback(t
         "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}],
         metadata=metadata, fallback_text="Inspect · running",
     )
-    await asyncio.sleep(0.05)
+    await wait_until(lambda: not adapter._status_cards)
 
     assert result.success is True
     assert not adapter._status_cards
@@ -904,7 +1006,7 @@ async def test_delayed_unknown_edit_failure_retries_on_next_frame(tmp_path, monk
     first = await adapter.send_native_task_card_progress(
         "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}], metadata=metadata,
     )
-    await asyncio.sleep(0.05)
+    await wait_until(lambda: bool(channel.message.edits))
     second = await adapter.send_native_task_card_progress(
         "channel-1", [{"id": "1", "title": "Inspect", "status": "completed"}], metadata=metadata,
     )

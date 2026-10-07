@@ -103,7 +103,7 @@ async def resolve_approval_prompt(
     try:
         count = resolve_gateway_approval(session_key, choice)
     except Exception as exc:
-        logger.error("[Discord] Failed to resolve gateway approval for session %s: %s", session_key, exc)
+        logger.error("[Discord] Failed to resolve gateway approval for session %s: %s", session_key, exc, exc_info=True)
         count = 0
     if not count:
         return 0
