@@ -4692,27 +4692,39 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _disable_status_card_after_permanent_failure(
         self, card: CardState, *, send_fallback: bool, result: Optional[SendResult] = None,
     ) -> None:
-        logger.warning(
-            "[Discord] Disabling status card %s after permanent lifecycle failure: %s",
-            card.nonce, getattr(result, "error", None) or "unknown failure",
-        )
-        await self._stop_status_card_refresh(card)
-        if not await self._compare_pop_status_card(card):
-            return
-        await self._remove_status_card_persistence(card)
-        if not send_fallback or card.fallback_sent:
-            card.fallback_sent = True
-            return
-        card.fallback_sent = True
-        text = card.fallback_text.strip()
-        if not text:
-            last_task = card.tasks[-1] if card.tasks else {}
-            title = str(last_task.get("title") or last_task.get("id") or "run")
-            text = f"-# {title} · progress card unavailable"
-        try:
-            await self.send(card.chat_id, text, metadata=dict(card.delivery_metadata))
-        except Exception:
-            logger.warning("[Discord] Status-card text fallback failed", exc_info=True)
+        async with card.lock:
+            if card.terminal_completed or card.terminalizing:
+                return
+            card.terminalizing = True
+            try:
+                logger.warning(
+                    "[Discord] Disabling status card %s after permanent lifecycle failure: %s",
+                    card.nonce, getattr(result, "error", None) or "unknown failure",
+                )
+                await self._stop_status_card_refresh(card)
+                if card.coalescer is not None:
+                    await card.coalescer.close()
+                if not await self._compare_pop_status_card(card):
+                    card.terminal_completed = True
+                    return
+                await self._remove_status_card_persistence(card)
+                if not send_fallback or card.fallback_sent:
+                    card.fallback_sent = True
+                    card.terminal_completed = True
+                    return
+                card.fallback_sent = True
+                text = card.fallback_text.strip()
+                if not text:
+                    last_task = card.tasks[-1] if card.tasks else {}
+                    title = str(last_task.get("title") or last_task.get("id") or "run")
+                    text = f"-# {title} · progress card unavailable"
+                try:
+                    await self.send(card.chat_id, text, metadata=dict(card.delivery_metadata))
+                except Exception:
+                    logger.warning("[Discord] Status-card text fallback failed", exc_info=True)
+                card.terminal_completed = True
+            finally:
+                card.terminalizing = False
 
     async def _handle_status_card_coalescer_failure(
         self, card: CardState, result: SendResult,
