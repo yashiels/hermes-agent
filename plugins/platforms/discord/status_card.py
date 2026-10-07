@@ -360,9 +360,12 @@ class StatusCardCoalescer:
             return SendResult(success=True)
 
     async def _drain(self, delay: float) -> None:
+        result: Optional[SendResult] = None
         try:
             await asyncio.sleep(delay)
             async with self._lock:
+                if self._task is not asyncio.current_task():
+                    return
                 frame = self._latest
                 self._latest = None
                 if self._closed or frame is None:
@@ -370,41 +373,52 @@ class StatusCardCoalescer:
                 result = await self._edit(frame)
                 if result.success:
                     self._last_edit = time.monotonic()
-                elif self._on_failure is not None:
-                    await self._on_failure(result)
+                self._task = None
+            if result is not None and not result.success and self._on_failure is not None:
+                await self._on_failure(result)
         except asyncio.CancelledError:
             raise
         finally:
-            if self._task is asyncio.current_task():
-                self._task = None
+            async with self._lock:
+                if self._task is asyncio.current_task():
+                    self._task = None
 
-    async def _cancel_pending_task(self) -> None:
+    def _cancel_pending_task(self) -> Optional[asyncio.Task]:
         task = self._task
         self._task = None
-        if task is not None and not task.done():
+        if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
+            return task
+        return None
+
+    @staticmethod
+    async def _await_cancelled_task(task: Optional[asyncio.Task]) -> None:
+        if task is not None:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
 
     async def flush(self) -> SendResult:
-        await self._cancel_pending_task()
         async with self._lock:
+            task = self._cancel_pending_task()
             frame = self._latest
             self._latest = None
             if not self._closed and frame is not None:
                 result = await self._edit(frame)
                 if result.success:
                     self._last_edit = time.monotonic()
-                return result
-        return SendResult(success=True)
+            else:
+                result = SendResult(success=True)
+        await self._await_cancelled_task(task)
+        return result
 
     async def close(self) -> SendResult:
-        await self._cancel_pending_task()
         async with self._lock:
+            task = self._cancel_pending_task()
             self._latest = None
             self._closed = True
+        await self._await_cancelled_task(task)
         return SendResult(success=True)
 
 
