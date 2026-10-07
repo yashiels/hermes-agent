@@ -67,6 +67,9 @@ class _GatewayControls:
     async def stop_if_current(self, session_key: str, generation: int) -> bool:
         return await self._runner._gateway_stop_if_current(session_key, generation)
 
+    def is_current(self, session_key: str, generation: int) -> bool:
+        return self._runner._is_session_run_current(session_key, generation)
+
     async def retry_if_last(self, session_key: str, final_message_id: str) -> bool:
         return await self._runner._gateway_retry_if_last(session_key, final_message_id)
 

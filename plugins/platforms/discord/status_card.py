@@ -341,12 +341,12 @@ class StatusCardCoalescer:
         self._task: Optional[asyncio.Task] = None
         self._last_edit = 0.0
         self._lock = asyncio.Lock()
-        self._stopped = False
+        self._closed = False
 
     async def submit(self, frame: StatusCardFrame) -> SendResult:
         async with self._lock:
-            if self._stopped:
-                return SendResult(success=False, error="status card stopped")
+            if self._closed:
+                return SendResult(success=True, error="status card closed")
             self._latest = frame
             remaining = self._interval - (time.monotonic() - self._last_edit)
             if remaining <= 0 and self._task is None:
@@ -365,7 +365,7 @@ class StatusCardCoalescer:
             async with self._lock:
                 frame = self._latest
                 self._latest = None
-                if self._stopped or frame is None:
+                if self._closed or frame is None:
                     return
                 result = await self._edit(frame)
                 if result.success:
@@ -378,7 +378,7 @@ class StatusCardCoalescer:
             if self._task is asyncio.current_task():
                 self._task = None
 
-    async def stop(self, *, flush: bool) -> SendResult:
+    async def _cancel_pending_task(self) -> None:
         task = self._task
         self._task = None
         if task is not None and not task.done():
@@ -387,15 +387,24 @@ class StatusCardCoalescer:
                 await task
             except asyncio.CancelledError:
                 pass
+
+    async def flush(self) -> SendResult:
+        await self._cancel_pending_task()
         async with self._lock:
             frame = self._latest
             self._latest = None
-            self._stopped = True
-            if flush and frame is not None:
+            if not self._closed and frame is not None:
                 result = await self._edit(frame)
                 if result.success:
                     self._last_edit = time.monotonic()
                 return result
+        return SendResult(success=True)
+
+    async def close(self) -> SendResult:
+        await self._cancel_pending_task()
+        async with self._lock:
+            self._latest = None
+            self._closed = True
         return SendResult(success=True)
 
 
@@ -419,6 +428,7 @@ class CardState:
     delivery_metadata: dict[str, Any] = field(default_factory=dict)
     fallback_sent: bool = False
     terminal_completed: bool = False
+    terminalizing: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     coalescer: Optional[StatusCardCoalescer] = None
     refresh_task: Optional[asyncio.Task] = None

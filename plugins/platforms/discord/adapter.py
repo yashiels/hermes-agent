@@ -4540,6 +4540,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             retryable=not permanent,
         )
 
+    @staticmethod
+    def _status_card_permanent_failure(result: SendResult) -> bool:
+        error = str(result.error or "").strip().lower()
+        return not result.success and not result.retryable and error not in {
+            "status card stopped", "status card closed",
+        }
+
     async def _edit_status_card_frame(self, card: CardState, frame: StatusCardFrame) -> SendResult:
         try:
             view = StatusCardView(
@@ -4587,8 +4594,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                         return
                     card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
                     result = await card.coalescer.submit(card.frame())
-                if not result.success and not result.retryable:
-                    await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
+                if self._status_card_permanent_failure(result):
+                    await self._disable_status_card_after_permanent_failure(
+                        card, send_fallback=True, result=result,
+                    )
                     return
         except asyncio.CancelledError:
             raise
@@ -4681,8 +4690,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             raise
 
     async def _disable_status_card_after_permanent_failure(
-        self, card: CardState, *, send_fallback: bool,
+        self, card: CardState, *, send_fallback: bool, result: Optional[SendResult] = None,
     ) -> None:
+        logger.warning(
+            "[Discord] Disabling status card %s after permanent lifecycle failure: %s",
+            card.nonce, getattr(result, "error", None) or "unknown failure",
+        )
         await self._stop_status_card_refresh(card)
         if not await self._compare_pop_status_card(card):
             return
@@ -4704,59 +4717,72 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _handle_status_card_coalescer_failure(
         self, card: CardState, result: SendResult,
     ) -> None:
-        if result.retryable:
+        if not self._status_card_permanent_failure(result):
             return
-        await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
+        await self._disable_status_card_after_permanent_failure(
+            card, send_fallback=True, result=result,
+        )
 
-    async def _terminalize_status_card(
+    async def _terminalize_card_once(
         self, card: CardState, *, outcome: str, metadata: Optional[Dict[str, Any]],
     ) -> bool:
         async with card.lock:
             if card.terminal_completed:
                 return True
-            await self._stop_status_card_refresh(card)
-            if card.coalescer is not None:
-                await card.coalescer.stop(flush=False)
-            card.state = outcome
-            card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
-            finished_at = time.time()
-            history_nonce = await self._record_status_card_history(card, finished_at)
-            frame = card.frame()
-            frame.history_nonce = history_nonce
-            terminal_succeeded = False
-            for attempt in range(3):
-                result = await self._edit_status_card_frame(card, frame)
-                if result.success:
-                    terminal_succeeded = True
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(0.25 * (2 ** attempt))
-            notice_succeeded = False
-            controls_removed = False
-            if not terminal_succeeded:
-                try:
-                    await card.message.edit(view=None)
-                    controls_removed = True
-                except Exception:
-                    pass
-                notice_metadata = dict(card.delivery_metadata)
-                notice_metadata.update(metadata or {})
-                if card.thread_key:
-                    notice_metadata["thread_id"] = card.thread_key
-                try:
-                    notice = await self.send(
-                        card.chat_id, f"-# run {outcome} · status card could not be updated",
-                        metadata=notice_metadata,
+            card.terminalizing = True
+            try:
+                await self._stop_status_card_refresh(card)
+                if card.coalescer is not None:
+                    await card.coalescer.close()
+                card.state = outcome
+                card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
+                finished_at = time.time()
+                history_nonce = await self._record_status_card_history(card, finished_at)
+                frame = card.frame()
+                frame.history_nonce = history_nonce
+                terminal_succeeded = False
+                for attempt in range(3):
+                    result = await self._edit_status_card_frame(card, frame)
+                    if result.success:
+                        terminal_succeeded = True
+                        break
+                    logger.warning(
+                        "[Discord] Status-card terminal edit attempt %d/3 failed for %s: %s",
+                        attempt + 1, card.nonce, result.error or "unknown failure",
                     )
-                    notice_succeeded = bool(notice.success)
-                except Exception:
-                    logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
-            completed = terminal_succeeded or controls_removed or notice_succeeded
-            if completed:
-                await self._compare_pop_status_card(card)
-                await self._remove_status_card_persistence(card)
-                card.terminal_completed = True
-            return completed
+                    if attempt < 2:
+                        await asyncio.sleep(0.25 * (2 ** attempt))
+                notice_succeeded = False
+                controls_removed = False
+                if not terminal_succeeded:
+                    try:
+                        await card.message.edit(view=None)
+                        controls_removed = True
+                    except Exception as exc:
+                        logger.warning(
+                            "[Discord] Status-card control removal failed for %s: %s",
+                            card.nonce, exc,
+                        )
+                    notice_metadata = dict(card.delivery_metadata)
+                    notice_metadata.update(metadata or {})
+                    if card.thread_key:
+                        notice_metadata["thread_id"] = card.thread_key
+                    try:
+                        notice = await self.send(
+                            card.chat_id, f"-# run {outcome} · status card could not be updated",
+                            metadata=notice_metadata,
+                        )
+                        notice_succeeded = bool(notice.success)
+                    except Exception:
+                        logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
+                completed = terminal_succeeded or controls_removed or notice_succeeded
+                if completed:
+                    await self._compare_pop_status_card(card)
+                    await self._remove_status_card_persistence(card)
+                    card.terminal_completed = True
+                return completed
+            finally:
+                card.terminalizing = False
 
     def _read_status_card_entries(self) -> list[dict[str, Any]]:
         try:
@@ -4764,6 +4790,84 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except (OSError, ValueError):
             return []
         return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+
+    def _status_card_run_is_current(self, session_key: str, generation: int) -> bool:
+        run_key = (str(session_key), int(generation))
+        if run_key in self._ended_status_runs:
+            return False
+        checker = getattr(self._gateway_controls, "is_current", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker(*run_key))
+        except Exception:
+            logger.warning("[Discord] Status-card current-run check failed", exc_info=True)
+            return True
+
+    async def _reconcile_persisted_status_card(self, entry: Dict[str, Any]) -> None:
+        nonce = str(entry.get("nonce") or "")
+        channel_id = str(entry.get("channel_id") or "")
+        message_id = str(entry.get("message_id") or "")
+        if not channel_id or not message_id:
+            self._status_card_persisted.pop(nonce, None)
+            return
+        try:
+            channel = await self._resolve_channel(channel_id)
+            if channel is None:
+                raise RuntimeError(f"Channel {channel_id} not found")
+            message = channel.get_partial_message(int(message_id))
+            view = StatusCardView(
+                [], nonce=None, title="Hermes run", state="interrupted-restart",
+                elapsed_s=max(0.0, time.time() - float(entry.get("started_at") or time.time())),
+                iteration=0, max_iterations=0,
+            )
+            await message.edit(view=view)
+            self._status_card_persisted.pop(nonce, None)
+        except Exception as exc:
+            try:
+                attempts = max(0, int(entry.get("reconcile_attempts") or 0)) + 1
+            except (TypeError, ValueError):
+                attempts = 1
+            if attempts >= 3:
+                self._status_card_persisted.pop(nonce, None)
+                logger.warning(
+                    "[Discord] Dropping status card %s/%s after 3 reconciliation failures: %s",
+                    channel_id, message_id, exc,
+                )
+            else:
+                retained = dict(entry)
+                retained["reconcile_attempts"] = attempts
+                self._status_card_persisted[nonce] = retained
+                logger.warning(
+                    "[Discord] Status-card reconciliation attempt %d/3 failed for %s/%s: %s",
+                    attempts, channel_id, message_id, exc,
+                )
+
+    async def _sweep_orphaned_status_cards(self, ended_nonce: str) -> None:
+        for card in list(self._status_cards.values()):
+            if card.nonce == ended_nonce or self._status_card_run_is_current(
+                card.session_key, card.generation,
+            ):
+                continue
+            await self._terminalize_card_once(
+                card, outcome="interrupted", metadata=card.delivery_metadata,
+            )
+        live_nonces = set(self._status_card_keys_by_nonce)
+        changed = False
+        for nonce, entry in list(self._status_card_persisted.items()):
+            if nonce in live_nonces:
+                continue
+            session_key = str(entry.get("session_key") or "")
+            try:
+                generation = int(entry.get("generation"))
+            except (TypeError, ValueError):
+                continue
+            if self._status_card_run_is_current(session_key, generation):
+                continue
+            await self._reconcile_persisted_status_card(entry)
+            changed = True
+        if changed:
+            await self._persist_status_cards()
 
     async def _reconcile_status_cards(self) -> None:
         entries = await asyncio.to_thread(self._read_status_card_entries)
@@ -4776,42 +4880,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             nonce = str(entry.get("nonce") or "")
             if nonce in self._status_card_keys_by_nonce:
                 continue
-            channel_id = str(entry.get("channel_id") or "")
-            message_id = str(entry.get("message_id") or "")
-            if not channel_id or not message_id:
-                self._status_card_persisted.pop(nonce, None)
-                continue
-            try:
-                channel = await self._resolve_channel(channel_id)
-                if channel is None:
-                    raise RuntimeError(f"Channel {channel_id} not found")
-                message = channel.get_partial_message(int(message_id))
-                view = StatusCardView(
-                    [], nonce=None, title="Hermes run", state="interrupted-restart",
-                    elapsed_s=max(0.0, time.time() - float(entry.get("started_at") or time.time())),
-                    iteration=0, max_iterations=0,
-                )
-                await message.edit(view=view)
-                self._status_card_persisted.pop(nonce, None)
-            except Exception as exc:
-                try:
-                    attempts = max(0, int(entry.get("reconcile_attempts") or 0)) + 1
-                except (TypeError, ValueError):
-                    attempts = 1
-                if attempts >= 3:
-                    self._status_card_persisted.pop(nonce, None)
-                    logger.warning(
-                        "[Discord] Dropping status card %s/%s after 3 reconciliation failures: %s",
-                        channel_id, message_id, exc,
-                    )
-                else:
-                    retained = dict(entry)
-                    retained["reconcile_attempts"] = attempts
-                    self._status_card_persisted[nonce] = retained
-                    logger.warning(
-                        "[Discord] Status-card reconciliation attempt %d/3 failed for %s/%s: %s",
-                        attempts, channel_id, message_id, exc,
-                    )
+            await self._reconcile_persisted_status_card(entry)
         await self._persist_status_cards()
 
     def native_task_card_destination_supported(
@@ -4833,7 +4902,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         key = self._status_card_key(chat_id, metadata)
         card = self._status_cards.get(key)
         if card is not None and card.nonce != run["nonce"]:
-            superseded_closed = await self._terminalize_status_card(
+            superseded_closed = await self._terminalize_card_once(
                 card, outcome="interrupted", metadata=card.delivery_metadata,
             )
             if not superseded_closed:
@@ -4878,6 +4947,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "channel_id": card.channel_id,
                 "message_id": str(card.message.id),
                 "nonce": card.nonce,
+                "session_key": card.session_key,
+                "generation": card.generation,
                 "started_at": card.started_at,
                 "reconcile_attempts": 0,
             }
@@ -4891,8 +4962,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if card.state != "waiting-approval":
             card.state = "running"
         result = await card.coalescer.submit(card.frame())
-        if not result.success and not result.retryable:
-            await self._disable_status_card_after_permanent_failure(card, send_fallback=False)
+        if self._status_card_permanent_failure(result):
+            await self._disable_status_card_after_permanent_failure(
+                card, send_fallback=False, result=result,
+            )
         return result
 
     async def stop_native_task_card_progress(
@@ -4907,7 +4980,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
             return
         if card.coalescer is not None:
-            await card.coalescer.stop(flush=True)
+            result = await card.coalescer.flush()
+            if self._status_card_permanent_failure(result):
+                await self._disable_status_card_after_permanent_failure(
+                    card, send_fallback=False, result=result,
+                )
 
     async def update_native_task_card_activity(
         self, chat_id: str, *, elapsed_s: float, iteration: int, max_iterations: int,
@@ -4924,8 +5001,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         card.iteration = max(0, int(iteration))
         card.max_iterations = max(0, int(max_iterations))
         result = await card.coalescer.submit(card.frame())
-        if not result.success and not result.retryable:
-            await self._disable_status_card_after_permanent_failure(card, send_fallback=False)
+        if self._status_card_permanent_failure(result):
+            await self._disable_status_card_after_permanent_failure(
+                card, send_fallback=False, result=result,
+            )
         return bool(result.success)
 
     async def finalize_native_task_card(
@@ -4939,7 +5018,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         card = self._status_cards.get(key) if key is not None else None
         if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
             return False
-        return await self._terminalize_status_card(card, outcome=outcome, metadata=metadata)
+        return await self._terminalize_card_once(card, outcome=outcome, metadata=metadata)
 
     async def on_turn_end(
         self, chat_id: str, *, metadata: Optional[Dict[str, Any]], outcome: str,
@@ -4960,10 +5039,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         key = self._status_card_keys_by_nonce.get(run["nonce"])
         card = self._status_cards.get(key) if key is not None else None
         if card is not None and card.generation == run["generation"] and card.session_key == run["session_key"]:
-            await self._stop_status_card_refresh(card)
-            if card.coalescer is not None:
-                await card.coalescer.stop(flush=False)
-            await self._compare_pop_status_card(card)
+            await self._terminalize_card_once(card, outcome=outcome, metadata=metadata)
+        await self._sweep_orphaned_status_cards(run["nonce"])
 
     async def _set_status_card_approval(
         self, metadata: Optional[Dict[str, Any]], waiting: bool,
@@ -4977,8 +5054,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return
         card.state = "waiting-approval" if waiting else "running"
         result = await card.coalescer.submit(card.frame())
-        if not result.success and not result.retryable:
-            await self._disable_status_card_after_permanent_failure(card, send_fallback=True)
+        if self._status_card_permanent_failure(result):
+            await self._disable_status_card_after_permanent_failure(
+                card, send_fallback=True, result=result,
+            )
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *,

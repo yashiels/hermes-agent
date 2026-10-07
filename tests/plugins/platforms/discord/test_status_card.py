@@ -3,7 +3,9 @@ import json
 import queue
 import re
 import sys
+import threading
 import time
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -85,9 +87,13 @@ discord.ui.ActionRow = FakeActionRow
 discord.ui.DynamicItem = FakeDynamicItem
 discord.ui.LayoutView = FakeLayoutView
 
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.base import SendResult
+from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
+from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.discord.status_card import (
     ShowAllCardButton,
@@ -142,6 +148,42 @@ class FakeChannel:
         return next(message for message in self.messages if str(message.id) == str(message_id))
 
 
+class RedirectingAgent:
+    _supports_active_turn_redirect = True
+
+    def __init__(self):
+        self._model_request_active = threading.Event()
+        self._model_request_active.set()
+        self._interrupt_requested = False
+        self._pending_redirect = None
+        self.abort_count = 0
+        self.steer_count = 0
+
+    @property
+    def is_interrupted(self):
+        return self._interrupt_requested
+
+    def redirect(self, text):
+        if not text.strip() or not self._model_request_active.is_set():
+            return False
+        self._pending_redirect = text.strip()
+        self._interrupt_requested = True
+        self.abort_count += 1
+        return True
+
+    def retry(self):
+        redirected = self._pending_redirect
+        self._pending_redirect = None
+        self._interrupt_requested = False
+        return redirected
+
+    def steer(self, text):
+        if not text.strip():
+            return False
+        self.steer_count += 1
+        return True
+
+
 def run_metadata(generation=1, nonce="0123456789abcdef", session_key="session-1", thread_id="thread-1"):
     return {
         "thread_id": thread_id,
@@ -167,6 +209,14 @@ def make_adapter(tmp_path, monkeypatch, *, enabled=True, channel=None):
     return adapter, channel
 
 
+async def wait_until(predicate, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition did not become true")
+        await asyncio.sleep(0.005)
+
+
 def view_texts(view):
     return [item.content for item in view.walk_children() if hasattr(item, "content")]
 
@@ -190,6 +240,111 @@ def show_all_interaction(adapter, *, user_id=7, roles=None, order=None):
         response=SimpleNamespace(defer=AsyncMock(side_effect=defer)),
         followup=SimpleNamespace(send=AsyncMock(side_effect=send)),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["redirect", "steer", "slow-final-only"])
+async def test_status_card_survives_progress_cleanup_before_final_delivery(
+    tmp_path, monkeypatch, mode,
+):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    adapter.config.typing_indicator = False
+    adapter._status_card_refresh_interval = 0.01
+    session_key = "agent:main:discord:thread:thread-1"
+    metadata = run_metadata(session_key=session_key)
+    token = metadata["hermes_run"]
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id="channel-1", chat_type="thread",
+        thread_id="thread-1", user_id="owner-1",
+    )
+    opening = MessageEvent(
+        text="start", message_type=MessageType.TEXT, source=source, message_id="message-a",
+    )
+    incoming = MessageEvent(
+        text="correct it", message_type=MessageType.TEXT, source=source, message_id="message-b",
+    )
+    agent = RedirectingAgent()
+    ctx = TurnContext(
+        source=source, session_key=session_key, run_generation=token["generation"],
+        event_message_id="message-a", inbound_message_id="message-a",
+        progress_queue=queue.Queue(), _progress_reply_to="message-a",
+        _progress_metadata=metadata, agent_holder=[agent],
+    )
+    current = True
+    ctx._run_still_current = lambda: current
+    redirect_runner = GatewayRunner(config=GatewayConfig())
+    active_turn = redirect_runner._session_state(session_key).turn
+    active_turn.agent = agent
+    active_turn.event = opening
+    active_turn.ctx = ctx
+    sent = []
+    final_sent = asyncio.Event()
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        if content == "final answer":
+            await asyncio.sleep(0.04)
+            sent.append(("answer", content))
+            final_sent.set()
+            return SendResult(success=True, message_id="final-1")
+        await final_sent.wait()
+        sent.append(("fallback", content))
+        return SendResult(success=True, message_id="fallback-1")
+
+    adapter.send = send
+
+    async def handler(event):
+        nonlocal current
+        event._hermes_run = token
+        event._hermes_turn_outcome = "done"
+        lane = asyncio.create_task(TurnRunner(None, ctx)._send_native_task_card_progress(adapter))
+        ctx.progress_queue.put({
+            "type": "tool.started", "tool_call_id": "call-1", "tool_name": "terminal",
+        })
+        await wait_until(lambda: bool(channel.sends))
+        if mode == "redirect":
+            assert redirect_runner._redirect_active_turn(
+                agent, incoming.text, session_key, incoming,
+            ) is True
+            assert agent.retry().endswith(incoming.text)
+        elif mode == "steer":
+            outcome = await redirect_runner._resolve_busy_steer_or_redirect(
+                incoming, session_key, "steer", agent,
+            )
+            assert outcome.steered is True
+        ctx.progress_queue.put({
+            "type": "tool.completed", "tool_call_id": "call-1", "tool_name": "terminal",
+        })
+        await wait_until(
+            lambda: next(iter(adapter._status_cards.values())).tasks[0]["status"] == "complete"
+        )
+        current = False
+        lane.cancel()
+        with suppress(asyncio.CancelledError):
+            await lane
+        return "final answer"
+
+    adapter.set_message_handler(handler)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    await asyncio.wait_for(adapter._process_message_background(opening, session_key), timeout=2.0)
+    await asyncio.sleep(0.06)
+
+    final_view = channel.message.edits[-1]["view"]
+    assert (
+        [kind for kind, _content in sent],
+        len(channel.sends),
+        any("done" in text for text in view_texts(final_view)),
+        [button.label for button in view_buttons(final_view)],
+        ctx.event_message_id,
+        agent.abort_count,
+    ) == (
+        ["answer"],
+        1,
+        True,
+        [],
+        "message-b" if mode == "redirect" else "message-a",
+        1 if mode == "redirect" else 0,
+    )
+    assert agent.steer_count == (1 if mode == "steer" else 0)
 
 
 def test_status_card_view_trims_text_and_components():
@@ -355,10 +510,110 @@ async def test_coalescer_cancellation_drops_throttled_frame():
 
     await coalescer.submit(first)
     await coalescer.submit(second)
-    await coalescer.stop(flush=False)
+    await coalescer.close()
     await asyncio.sleep(0.07)
 
     assert edits == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_coalescer_flush_resumes_with_interval_and_close_drops_frames():
+    edits = []
+
+    async def edit(frame):
+        edits.append(frame.state)
+        return SendResult(success=True)
+
+    coalescer = StatusCardCoalescer(edit, interval=0.05)
+    running = StatusCardFrame([], "Run", "running", 0, 0, 0)
+    waiting = StatusCardFrame([], "Run", "waiting-approval", 0, 0, 0)
+    resumed = StatusCardFrame([], "Run", "running", 1, 0, 0)
+
+    await coalescer.submit(running)
+    await coalescer.submit(waiting)
+    await coalescer.flush()
+    await coalescer.submit(resumed)
+    await asyncio.sleep(0.02)
+    assert edits == ["running", "waiting-approval"]
+    await asyncio.sleep(0.05)
+    assert edits == ["running", "waiting-approval", "running"]
+    await coalescer.submit(waiting)
+    await coalescer.close()
+    result = await coalescer.submit(running)
+    await asyncio.sleep(0.06)
+    assert result.success is True
+    assert result.error == "status card closed"
+    assert edits == ["running", "waiting-approval", "running"]
+
+
+@pytest.mark.asyncio
+async def test_lane_restart_reuses_card_and_terminalizes_once(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    first = [{"id": "1", "title": "Inspect", "status": "running"}]
+    second = [{"id": "1", "title": "Inspect", "status": "complete"}]
+
+    await adapter.send_native_task_card_progress("channel-1", first, metadata=metadata)
+    await adapter.stop_native_task_card_progress("channel-1", metadata=metadata)
+    await adapter.send_native_task_card_progress("channel-1", second, metadata=metadata)
+    await adapter.stop_native_task_card_progress("channel-1", metadata=metadata)
+    await adapter.finalize_native_task_card(
+        "channel-1", outcome="done", reply_to=None, metadata=metadata,
+    )
+    await adapter.on_turn_end("channel-1", metadata=metadata, outcome="done")
+
+    terminal_edits = [
+        edit for edit in channel.message.edits
+        if "done" in view_texts(edit["view"])[1]
+    ]
+    assert len(channel.sends) == 1
+    assert len(terminal_edits) == 1
+    assert not adapter._status_cards
+
+
+@pytest.mark.asyncio
+async def test_on_turn_end_terminalizes_when_finalize_was_skipped(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "complete"}],
+        metadata=metadata,
+    )
+
+    await adapter.on_turn_end("channel-1", metadata=metadata, outcome="done")
+
+    assert "done" in view_texts(channel.message.edits[-1]["view"])[1]
+    assert view_buttons(channel.message.edits[-1]["view"]) == []
+    assert not adapter._status_cards
+
+
+@pytest.mark.asyncio
+async def test_interrupt_terminalizes_without_text_fallback(tmp_path, monkeypatch):
+    adapter, channel = make_adapter(tmp_path, monkeypatch)
+    metadata = run_metadata()
+    token = metadata["hermes_run"]
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id="channel-1", chat_type="thread",
+        thread_id="thread-1",
+    )
+    event = MessageEvent(text="stop", source=source, message_id="message-1")
+    event._hermes_run = token
+    event._hermes_turn_outcome = "done"
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Inspect", "status": "running"}],
+        metadata=metadata, fallback_text="fallback",
+    )
+    interrupt = asyncio.Event()
+    interrupt.set()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-1"))
+
+    await adapter._run_gateway_turn_end_hooks(
+        event, token["session_key"], interrupt, metadata, False, False,
+    )
+
+    assert "interrupted" in view_texts(channel.message.edits[-1]["view"])[1]
+    assert view_buttons(channel.message.edits[-1]["view"]) == []
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -693,6 +948,50 @@ async def test_reconnect_reconciliation_skips_live_card(tmp_path, monkeypatch):
     assert channel.message.edits == []
     assert adapter._status_cards
     assert json.loads(adapter._status_card_persistence_path.read_text())
+
+
+@pytest.mark.asyncio
+async def test_turn_end_sweeps_orphans_without_touching_current_cards(tmp_path, monkeypatch):
+    channel = FakeChannel(new_message_each_send=True)
+    adapter, _channel = make_adapter(tmp_path, monkeypatch, channel=channel)
+    orphan = run_metadata(
+        generation=1, nonce="1111111111111111", session_key="session-orphan", thread_id="thread-1",
+    )
+    current = run_metadata(
+        generation=2, nonce="2222222222222222", session_key="session-current", thread_id="thread-2",
+    )
+    ended = run_metadata(
+        generation=3, nonce="3333333333333333", session_key="session-ended", thread_id="thread-3",
+    )
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "1", "title": "Old", "status": "running"}], metadata=orphan,
+    )
+    orphan_message = channel.message
+    await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "2", "title": "Live", "status": "running"}], metadata=current,
+    )
+    current_message = channel.message
+    persisted_message = FakeMessage("102")
+    channel.messages.append(persisted_message)
+    adapter._status_card_persisted["4444444444444444"] = {
+        "channel_id": "thread-4", "message_id": "102", "nonce": "4444444444444444",
+        "session_key": "session-persisted", "generation": 4, "started_at": time.time(),
+    }
+    await adapter._persist_status_cards()
+    adapter.set_gateway_controls(SimpleNamespace(
+        is_current=lambda session_key, generation: (
+            session_key, generation
+        ) == ("session-current", 2),
+    ))
+
+    await adapter.on_turn_end("channel-1", metadata=ended, outcome="done")
+
+    assert "interrupted" in view_texts(orphan_message.edits[-1]["view"])[1]
+    assert current_message.edits == []
+    assert "running" in view_texts(channel.sends[1]["view"])[1]
+    assert "gateway restarted" in view_texts(persisted_message.edits[-1]["view"])[1]
+    assert set(adapter._status_card_keys_by_nonce) == {"2222222222222222"}
+    assert set(adapter._status_card_persisted) == {"2222222222222222"}
 
 
 @pytest.mark.asyncio
