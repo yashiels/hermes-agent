@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
+from hermes_cli.plugins_hook_provenance import attributed_hook_result
 
 logger = logging.getLogger("hermes_cli.plugins")
 
@@ -314,8 +315,9 @@ class PluginDispatchMixin:
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
                 if ret is not None:
-                    results.append(ret)
+                    results.append(attributed_hook_result(hook_name, ret, cb))
             except (Exception, SystemExit) as exc:  # health: allow BLE001 -- moved from invoke_hook: plugin callbacks are untrusted; each failure is reported and isolated
+
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
                 if failed is not None:
                     failed.append(cb)
@@ -635,7 +637,7 @@ class PluginDispatchMixin:
                 if inspect.isawaitable(ret):
                     ret = await (asyncio.wait_for(ret, timeout) if use_timeout else ret)
                 if ret is not None:
-                    results.append(ret)
+                    results.append(attributed_hook_result(hook_name, ret, cb))
             except TimeoutError:
                 logger.warning("Hook '%s' callback %s timed out after %.0fs", hook_name, callback_name, timeout)
                 if fail_closed:  # policy hook: fail closed with a block directive
