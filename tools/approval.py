@@ -38,7 +38,7 @@ from tools.approval_floors import (
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
-from tools.approval_plugin_rules import allows_permanent_approval, permanent_approval_keys, format_tool_approval_target
+from tools.approval_plugin_rules import allows_permanent_approval, permanent_approval_keys, format_tool_approval_target, plugin_rule_exemption
 
 logger = logging.getLogger(__name__)
 
@@ -1130,7 +1130,10 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", tool_args: dict | None = None, approval_callback=None) -> dict:
+def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", tool_args: dict | None = None, approval_callback=None, plugin_name: str = "") -> dict:
+    exemption = plugin_rule_exemption(tool_name, tool_args, rule_key, plugin_name)
+    if exemption is not None:
+        return exemption
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
         rule_key = f"{tool_name}:{hashlib.sha256(description.encode('utf-8')).hexdigest()[:12]}"

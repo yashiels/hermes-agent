@@ -1,5 +1,4 @@
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
-
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
 docs of config.yaml.
 """
@@ -1705,6 +1704,7 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        "plugin_rule_exemptions": {},
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,

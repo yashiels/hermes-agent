@@ -2965,6 +2965,91 @@ approvals:
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](./security.md#user-defined-deny-rules-approvalsdeny) for details.
 
+### Plugin-rule exemptions
+
+`approvals.plugin_rule_exemptions` defaults to an empty mapping. It can exempt
+terminal `plugin_rule:terminal` escalations from the registered `jev-judge` plugin:
+
+```yaml
+approvals:
+  plugin_rule_exemptions:
+    rule_keys: ["plugin_rule:terminal"]
+    plugins: ["jev-judge"]
+    gh_owners: ["yashiels", "skynergroup", "nexiontech"]
+    git_local: true
+```
+
+Plugin identity comes from hook registration. A returned plugin name cannot grant
+an exemption. Multiple escalation directives keep the normal approval gate.
+Every command separated by `;`, `&&`, `||`, or `|` must qualify. ASCII control
+bytes other than tab, including NUL and newline, reject the entire call before
+tokenization, even inside quoted arguments.
+Malformed commands, substitutions, environment assignments, subshells, heredocs,
+backticks, `eval`, and redirections do not qualify.
+
+GitHub and Git commands qualify only with the bare executable names `gh` and
+`git`, resolved through PATH. Absolute, relative, and tilde-prefixed executable
+paths never qualify. GitHub commands require one explicit `-R`/`--repo` selector with an exact listed
+owner and a valid repository name. The supported operations are issue create,
+comment, edit, view, list, close, reopen; PR create, view, list, comment, edit,
+checks, diff, status; repo view; and run list, view, watch. `gh api` requires exactly
+one `repos/<owner>/<repo>/...` endpoint and permits only GET requests. Host
+overrides, duplicate targets, file inputs, values beginning with `@`, unknown
+options, aliases, extensions, `--web`, and `--` passthrough are refused.
+`--search`/`-S` are excluded because a query can name another repository. Host
+overrides are checked in the active profile as well as in the command.
+
+With `git_local: true`, git fetch, status, log, worktree add, and worktree list
+qualify, optionally preceded by `-C <path>`. Configuration overrides such as `-c`,
+external-command options, and URL remotes are refused. Option case is preserved.
+These operations still use the repository's existing Git configuration.
+
+SSH and Oracle exemptions are off unless their keys are configured. For example,
+using absolute paths to your installed scripts and permitted files:
+
+```yaml
+approvals:
+  plugin_rule_exemptions:
+    rule_keys: ["plugin_rule:terminal"]
+    plugins: ["jev-judge"]
+    ssh_hosts: ["forge", "atlas", "launchpad", "apollo", "iss"]
+    oracle:
+      scripts:
+        - "/home/user/Developer/github/yashiels/agent-scripts/skills/plan-forge/scripts/oracle-gate.sh"
+        - "/home/user/Developer/github/yashiels/agent-scripts/skills/oracle/scripts/oracle-ask.sh"
+      file_roots:
+        - "/home/user/Developer/github"
+        - "/home/user/.hermes/profiles/jarvis/cache/scratch"
+```
+
+SSH requires the literal executable `ssh` and an exact listed alias. Only `-T`,
+`-n`, `-q`, `-o BatchMode=yes`, and `-o ConnectTimeout=<integer>` are allowed
+before the destination; attached `-oKey=Value` forms also work. User prefixes,
+ports, URLs, forwarding, proxy/config overrides, and other options do not qualify.
+Quote remote commands containing flags or shell syntax. Local redirection,
+substitution, backgrounding, and pipelines cannot receive an SSH exemption.
+Every command in a compound call must still qualify.
+
+Oracle requires a configured script's real path, without an interpreter wrapper.
+It accepts `-p`/`--prompt`, repeatable `--file`, `--effort` (`low`, `medium`, or
+`high`), `--model`, `-l`/`--log`, and `--dry-run`. Tildes are expanded and symlinks
+followed for scripts and path arguments. Input files must remain under the listed
+file roots, including when they do not exist yet. Logs must remain in the
+configured profile scratch root or the system `/tmp` tree. {/* no-tmp: ok -- owner-approved Oracle log boundary */}
+
+Glob paths and leading `!` are refused. Resolved paths cannot contain `.ssh`,
+`.gnupg`, `.aws`, `.iai-mcp`, `.config`, or `.hermes`, except the ancestor of the
+explicitly configured `.hermes/profiles/<profile>/cache/scratch` root. Filenames
+matching `.env*`, `*.pem`, `*.key`, `*.p12`, `id_*`, `*secret*`, `*token*`,
+`*credential*`, `.netrc`, `.npmrc`, or `.pypirc` are refused, ignoring case.
+A forbidden or malformed `ssh_hosts` entry, including `orion` or `nebula`, or a
+non-absolute Oracle configuration path disables the entire exemption policy.
+
+Hard floors and deny rules block before exemption. Other tools and unmatched
+commands keep the chat prompt or cron denial. Exemptions log only the matched
+rule and owner at INFO. The former `plugin_rule_exempt_globs` setting no longer
+grants exemptions.
+
 ### Custom smart-approval policy
 
 `approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:

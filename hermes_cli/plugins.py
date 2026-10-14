@@ -20,6 +20,7 @@ import re
 import sys
 import threading
 import types
+
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
@@ -31,6 +32,7 @@ from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled
 from hermes_cli.config import load_config_readonly
 from hermes_cli.middleware import VALID_MIDDLEWARE
+from hermes_cli.plugins_hook_provenance import PreToolCallDirective
 from hermes_cli.plugin_capabilities import plugin_capability_granted
 from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV, legacy_relay_plugin_keys
 # Sibling modules' names are re-exported here (origin) so plugins and tests keep one import path.
@@ -942,6 +944,9 @@ class PluginContext:
 
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
+        from hermes_cli.plugins_hook_provenance import bind_plugin_hook
+        if hook_name == "pre_tool_call":
+            callback = bind_plugin_hook(callback, self.manifest.name)
         return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
@@ -1918,14 +1923,6 @@ def fire_pre_command_hook(
 _thread_tool_whitelist = threading.local()
 
 
-@dataclass(frozen=True)
-class _PreToolCallDirective:
-    action: Optional[str] = None
-    message: Optional[str] = None
-    rule_key: Optional[str] = None
-    modified_args: Optional[dict[str, Any]] = None
-
-
 def set_thread_tool_whitelist(
     allowed: Optional[set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
@@ -1942,7 +1939,7 @@ def _get_pre_tool_call_directive_details(
     tool_name: str, args: Optional[dict[str, Any]], task_id: str = "", session_id: str = "",
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
     middleware_trace: Optional[list[dict[str, Any]]] = None,
-) -> _PreToolCallDirective:
+) -> PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
     the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
     human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). Precedence is
@@ -1952,7 +1949,7 @@ def _get_pre_tool_call_directive_details(
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
+        return PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
     hook_results = invoke_lifecycle_hook(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
@@ -1960,7 +1957,8 @@ def _get_pre_tool_call_directive_details(
         api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
     )
     modified_args: Optional[dict[str, Any]] = None
-    first_approve: Optional[tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
+    first_approve: tuple[Optional[str], Optional[str], str] | None = None
+    approval_count = 0
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -1982,15 +1980,16 @@ def _get_pre_tool_call_directive_details(
         if action == "block" and not message:
             continue
         if action == "block":
-            return _PreToolCallDirective(action="block", message=message, modified_args=modified_args)
-        # approve is held back until the whole list has been scanned for a veto.
+            return PreToolCallDirective(action="block", message=message, modified_args=modified_args)
+        approval_count += 1
         if first_approve is None:
             rule_key = result.get("rule_key")
-            first_approve = (message, (rule_key.strip() or None) if isinstance(rule_key, str) else None)
+            first_approve = (message, (rule_key.strip() or None) if isinstance(rule_key, str) else None,
+                             getattr(result, "plugin_name", ""))
     if first_approve is not None:
-        return _PreToolCallDirective(action="approve", message=first_approve[0], rule_key=first_approve[1],
-                                     modified_args=modified_args)
-    return _PreToolCallDirective(modified_args=modified_args)
+        return PreToolCallDirective(action="approve", message=first_approve[0], rule_key=first_approve[1],
+                                     plugin_name=first_approve[2] if approval_count == 1 else "", modified_args=modified_args)
+    return PreToolCallDirective(modified_args=modified_args)
 
 
 def get_pre_tool_call_directive(
@@ -2019,7 +2018,7 @@ def resolve_pre_tool_block(
 
 
 def _resolve_block_from_details(
-    details: _PreToolCallDirective, tool_name: str, *, tool_args: Optional[dict[str, Any]] = None, turn_id: str = "", tool_call_id: str = "",
+    details: PreToolCallDirective, tool_name: str, *, tool_args: Optional[dict[str, Any]] = None, turn_id: str = "", tool_call_id: str = "",
     session_id: str = "",
 ) -> Optional[str]:
     """The ONE place for the fail-closed approval logic: ``block`` blocks with its message; an
@@ -2037,7 +2036,7 @@ def _resolve_block_from_details(
                 turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id)
         try:
             result = request_tool_approval(
-                tool_name, details.message or "", rule_key=details.rule_key or tool_name, tool_args=tool_args)
+                tool_name, details.message or "", rule_key=details.rule_key or tool_name, tool_args=tool_args, plugin_name=details.plugin_name)
         finally:
             if approval_tokens is not None:
                 with suppress(Exception):
