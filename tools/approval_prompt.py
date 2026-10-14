@@ -170,7 +170,7 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
         else:
             decision = _CLI_CHOICE_ALIASES.get(choice, "deny")
             if decision == "always" and not allow_permanent:
-                decision = "session"
+                decision = "deny"
         print(t(_CLI_CHOICE_I18N[decision]))
         return decision
     except (EOFError, KeyboardInterrupt):
