@@ -38,6 +38,7 @@ from tools.approval_floors import (
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
+from tools.approval_plugin_rules import allows_permanent_approval, permanent_approval_keys, format_tool_approval_target
 
 logger = logging.getLogger(__name__)
 
@@ -373,12 +374,16 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     regex-derived key so existing command_allowlist entries survive key migrations."""
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
-        approved = _permanent_set() | _session_approved.get(session_key, set())
+        approved = set(_session_approved.get(session_key, set()))
+        if allows_permanent_approval(pattern_key):
+            approved |= _permanent_set()
     return any(alias in approved for alias in aliases)
 
 
 def _is_permanently_approved(pattern_key: str) -> bool:
     """Permanent approval only, with compatibility for migrated pattern keys."""
+    if not allows_permanent_approval(pattern_key):
+        return False
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         return any(alias in _permanent_set() for alias in aliases)
@@ -387,7 +392,7 @@ def _is_permanently_approved(pattern_key: str) -> bool:
 def approve_permanent(pattern_key: str):
     """Add a pattern to the permanent allowlist."""
     with _lock:
-        _permanent_set().add(pattern_key)
+        _permanent_set().update(permanent_approval_keys({pattern_key}))
 
 
 def load_permanent(patterns: set):
@@ -395,13 +400,15 @@ def load_permanent(patterns: set):
     with _lock:
         governing = _permanent_set()
         governing.clear()
-        governing.update(patterns)
+        governing.update(permanent_approval_keys(patterns))
 
 
 def _persist_choice(session_key: str, choice: str, keys: list[str]) -> None:
     """Persist a human ``session``/``always`` choice for each pattern key. ``once`` persists nothing."""
     for key in keys:
         if choice not in ("session", "always"):
+            continue
+        if choice == "always" and not allows_permanent_approval(key):
             continue
         approve_session(session_key, key)
         if choice == "always":
@@ -436,7 +443,7 @@ def _read_permanent_allowlist() -> set:
         return set()
     if legacy:
         logger.warning("Recovered legacy string command_allowlist; re-save it as a list of strings.")
-    return set(raw)
+    return permanent_approval_keys(raw)
 
 
 # What ``command_allowlist`` held the last time this process synchronised with the
@@ -490,7 +497,7 @@ def save_permanent_allowlist(patterns: set):
         with _lock:
             key = _baseline_key()
             baseline = _permanent_baseline_by_home.get(key, set())
-            merged = on_disk | (set(patterns) - baseline)
+            merged = permanent_approval_keys(on_disk | (set(patterns) - baseline))
             config["command_allowlist"] = sorted(merged)
             save_config(config)
             _permanent_baseline_by_home[key] = set(merged)
@@ -574,6 +581,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
     pending["description"] = description
+    if not allows_permanent_approval(pattern_key):
+        pending.update(allow_permanent=False, allow_session=True)
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
     submit_pending(session_key, pending)
@@ -581,6 +590,7 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
         return {
             "approved": False, "pattern_key": pattern_key, "status": "approval_required",
             "command": command, "description": description,
+            **({"allow_permanent": False, "allow_session": True} if not allows_permanent_approval(pattern_key) else {}),
             "message": (f"⚠️ This action is potentially dangerous ({description}). "
                         f"Asking the user for approval.\n\n**Target:**\n```\n{command}\n```"),
         }
@@ -812,7 +822,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    allow_permanent = not smart_denied and all(allows_permanent_approval(key) for key in pattern_keys)
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -825,6 +835,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
+        if choice == "always" and not allow_permanent and not smart_denied:
+            return deny(spec.cli_denied, "denied")
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
         if not smart_denied:
             _persist_choice(session_key, choice, pattern_keys)
@@ -861,7 +873,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
+                "allow_permanent": allow_permanent,
                 "allow_session": not smart_denied,
             }
             if smart_denied:
@@ -1118,26 +1130,14 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
-    """Escalate an arbitrary tool call to the human-approval gate.
-
-    Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
-    it asks the SAME human gate as Tier-2 dangerous shell patterns (session/permanent
-    allowlist, CLI prompt, gateway pending, once/session/always/deny, timeout fail-closed), so
-    the LLM cannot skip it. Cron honors ``approvals.cron_mode``; any OTHER non-interactive
-    context without an approval bridge fails CLOSED. ``rule_key`` controls the ``[a]lways``
-    allowlist grain; when empty it is ``tool_name`` + a hash of ``reason`` so DISTINCT reasons
-    on the same tool persist independently. Returns the ``check_dangerous_command`` result shape.
-    """
+def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", tool_args: dict | None = None, approval_callback=None) -> dict:
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
         rule_key = f"{tool_name}:{hashlib.sha256(description.encode('utf-8')).hexdigest()[:12]}"
     subject = f"Tool '{tool_name}' requires approval ({description})"
     return _run_approval_gate(
-        # Namespaced so plugin-rule approvals share the allowlist machinery without ever colliding with a real
-        # command pattern key; the display target is a synthetic label for the display/allowlist layer.
         pattern_key=f"plugin_rule:{rule_key}", description=description,
-        display_target=f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
+        display_target=format_tool_approval_target(tool_name, tool_args), approval_callback=approval_callback,
         subject=subject, advice="Find an alternative approach.",
         autoapprove_log_prefix=f"plugin-escalated tool call '{tool_name}' in non-interactive non-gateway context",
         fail_closed_when_no_human=True,

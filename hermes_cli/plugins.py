@@ -2019,7 +2019,7 @@ def resolve_pre_tool_block(
 
 
 def _resolve_block_from_details(
-    details: _PreToolCallDirective, tool_name: str, *, turn_id: str = "", tool_call_id: str = "",
+    details: _PreToolCallDirective, tool_name: str, *, tool_args: Optional[dict[str, Any]] = None, turn_id: str = "", tool_call_id: str = "",
     session_id: str = "",
 ) -> Optional[str]:
     """The ONE place for the fail-closed approval logic: ``block`` blocks with its message; an
@@ -2036,14 +2036,13 @@ def _resolve_block_from_details(
             approval_tokens = set_current_observability_context(
                 turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id)
         try:
-            result = request_tool_approval(tool_name, details.message or "", rule_key=details.rule_key or tool_name)
+            result = request_tool_approval(
+                tool_name, details.message or "", rule_key=details.rule_key or tool_name, tool_args=tool_args)
         finally:
             if approval_tokens is not None:
                 with suppress(Exception):
                     reset_current_observability_context(approval_tokens)
     except Exception:
-        # Fail-closed: if the gate itself errors, block rather than silently execute an action a
-        # plugin flagged for approval.
         return f"BLOCKED: plugin approval gate failed for {tool_name}"
     if not result.get("approved"):
         return str(result.get("message") or f"BLOCKED: plugin approval required for {tool_name}")
@@ -2057,7 +2056,8 @@ def _dispatch_pre_tool_call_hooks(
     block/approve message (``None`` to proceed) and merged ``modify`` args (``None`` if none)."""
     details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
     block_msg = _resolve_block_from_details(
-        details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
+        details, tool_name, tool_args=details.modified_args if details.modified_args is not None else args,
+        **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
     return (block_msg, details.modified_args)
 
 
