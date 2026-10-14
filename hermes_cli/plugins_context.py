@@ -739,7 +739,9 @@ class PluginContext(PluginCapabilityCtxMixin):
         return handles
 
     def register_hook(self, hook_name: str, callback: Callable, *, hold_stream: bool = False) -> PluginRegistration:
-        """Register a lifecycle hook callback (``PluginDispatchMixin.track_hook``)."""
+        from hermes_cli.plugins_hook_provenance import bind_plugin_hook
+        if hook_name == "pre_tool_call":
+            callback = bind_plugin_hook(callback, self.manifest.name)
         return self._manager.track_hook(self, hook_name, callback, hold_stream=hold_stream)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
