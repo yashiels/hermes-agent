@@ -237,6 +237,15 @@ def mark_awaiting_text(clarify_id: str) -> bool:
         return entry is not None
 
 
+def mark_awaiting_text_if_pending(clarify_id: str) -> bool:
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set():
+            return False
+        entry.awaiting_text = True
+        return True
+
+
 def has_pending(session_key: str) -> bool:
     """True when this session has at least one pending clarify entry."""
     with _lock:

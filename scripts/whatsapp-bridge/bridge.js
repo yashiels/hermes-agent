@@ -31,6 +31,7 @@ import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedSender, matchesAllowedUser, matchesInboundWhatsAppGroup, parseAllowedUsers } from './allowlist.js';
+import { createPollStore } from './poll_store.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -49,7 +50,7 @@ import {
   inferMediaType,
   mediaPayloadForFile,
   normalizeWhatsAppId,
-  pollCreationMessageFromPayload,
+  rememberSentMessage,
   pollUpdateForAggregation,
   writeJsonLine,
 } from './bridge_helpers.js';
@@ -200,18 +201,6 @@ function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
   return chunks;
 }
 
-function rememberSentMessage(sent, payload) {
-  if (!sent?.key?.id) return;
-  if (sent.message) {
-    messageStore.remember(sent);
-    return;
-  }
-  const syntheticMessage = pollCreationMessageFromPayload(payload);
-  if (syntheticMessage) {
-    messageStore.remember({ ...sent, message: syntheticMessage });
-  }
-}
-
 function trackSentMessageId(sent) {
   rememberSentId(sent?.key?.id);
 }
@@ -267,6 +256,7 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
+const pollStore = await createPollStore({ file: path.join(SESSION_DIR, 'hermes-polls.json'), messageStore, rememberSentId });
 // Bounded cache of already-downloaded inbound media, so a later reply to an
 // uncaptioned photo/video/document/voice note can still surface the original
 // file — see createQuotedMediaCache's doc comment in bridge_helpers.js.
@@ -1029,7 +1019,8 @@ app.post('/send-poll', async (req, res) => {
     const payload = buildPollPayload({ question, options, selectableCount });
     const sent = await sendWithTimeout(chatId, payload);
     trackSentMessageId(sent);
-    rememberSentMessage(sent, payload);
+    rememberSentMessage(messageStore, sent, payload, chatId);
+    pollStore.remember(sent?.key?.id, chatId, payload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
