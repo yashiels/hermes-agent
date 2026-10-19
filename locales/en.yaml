@@ -1016,6 +1016,7 @@ platform:
     approved: "✅ Approved."
     denied: "❌ Denied."
     approval_expired: "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)."
+    approval_poll_question: "Allow this command?"
   yuanbao:
     slow_response_notice: "This task is a bit involved — still working on it, please hang on..."
     owner_command_denied: "⚠️ {command} is only available to the creator in private chat mode"

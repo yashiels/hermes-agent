@@ -970,6 +970,7 @@ platform:
     approved: "✅ Onaylandı."
     denied: "❌ Reddedildi."
     approval_expired: "⌛ Onay süresi doldu — komut çalıştırılmadı (zaten zaman aşımına uğradı veya başka bir yerde sonuçlandı)."
+    approval_poll_question: "Bu komuta izin verilsin mi?"
   yuanbao:
     slow_response_notice: "Bu görev biraz kapsamlı — hâlâ üzerinde çalışıyorum, lütfen bekleyin..."
     owner_command_denied: "⚠️ {command} yalnızca özel sohbet modunda oluşturucu tarafından kullanılabilir"
