@@ -979,6 +979,7 @@ platform:
     approved: "✅ Goedgekeur."
     denied: "❌ Geweier."
     approval_expired: "⌛ Goedkeuring het verval — die opdrag is nie uitgevoer nie (reeds uitgetel of elders afgehandel)."
+    approval_poll_question: "Hierdie opdrag toelaat?"
   shared:
     truncated_suffix: "\n...(afgekap)"
     unknown: "onbekend"

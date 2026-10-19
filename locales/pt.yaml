@@ -979,6 +979,7 @@ platform:
     approved: "✅ Aprovado."
     denied: "❌ Negado."
     approval_expired: "⌛ Aprovação expirada — o comando não foi executado (já excedeu o tempo limite ou foi resolvido em outro lugar)."
+    approval_poll_question: "Permitir este comando?"
   shared:
     truncated_suffix: "\n...(truncado)"
     unknown: "desconhecido"

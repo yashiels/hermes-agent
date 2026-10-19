@@ -979,6 +979,7 @@ platform:
     approved: "✅ Одобрено."
     denied: "❌ Отклонено."
     approval_expired: "⌛ Срок одобрения истёк — команда не выполнена (уже сработал тайм-аут или решение принято в другом месте)."
+    approval_poll_question: "Разрешить эту команду?"
   shared:
     truncated_suffix: "\n...(обрезано)"
     unknown: "неизвестно"

@@ -979,6 +979,7 @@ platform:
     approved: "✅ Approvato."
     denied: "❌ Negato."
     approval_expired: "⌛ Approvazione scaduta — il comando non è stato eseguito (timeout già scattato o risolto altrove)."
+    approval_poll_question: "Consentire questo comando?"
   shared:
     truncated_suffix: "\n...(troncato)"
     unknown: "sconosciuto"

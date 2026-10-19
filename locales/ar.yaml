@@ -979,6 +979,7 @@ platform:
     approved: "✅ تمت الموافقة."
     denied: "❌ تم الرفض."
     approval_expired: "⌛ انتهت صلاحية الموافقة — لم يُنفَّذ الأمر (انتهت مهلته أو حُسم في مكان آخر)."
+    approval_poll_question: "السماح بهذا الأمر؟"
   shared:
     truncated_suffix: "\n...(مقتطع)"
     unknown: "غير معروف"

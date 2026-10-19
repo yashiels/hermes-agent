@@ -1167,6 +1167,7 @@ platform:
     approved: "✅ Approuvé."
     denied: "❌ Refusé."
     approval_expired: "⌛ Approbation expirée — la commande n'a pas été exécutée (délai dépassé ou déjà résolue ailleurs)."
+    approval_poll_question: "Autoriser cette commande ?"
   shared:
     truncated_suffix: |2-
 

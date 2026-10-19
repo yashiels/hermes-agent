@@ -979,6 +979,7 @@ platform:
     approved: "✅ 已批准。"
     denied: "❌ 已拒絕。"
     approval_expired: "⌛ 批准已逾期 — 指令未執行（已逾時或已在其他地方處理）。"
+    approval_poll_question: "允許執行此指令？"
   shared:
     truncated_suffix: "\n...（已截斷）"
     unknown: "未知"

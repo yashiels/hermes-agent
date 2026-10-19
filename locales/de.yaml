@@ -979,6 +979,7 @@ platform:
     approved: "✅ Genehmigt."
     denied: "❌ Abgelehnt."
     approval_expired: "⌛ Genehmigung abgelaufen — Befehl wurde nicht ausgeführt (Zeitüberschreitung oder bereits anderswo entschieden)."
+    approval_poll_question: "Diesen Befehl zulassen?"
   shared:
     truncated_suffix: "\n...(gekürzt)"
     unknown: "unbekannt"

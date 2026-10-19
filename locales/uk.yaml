@@ -979,6 +979,7 @@ platform:
     approved: "✅ Схвалено."
     denied: "❌ Відхилено."
     approval_expired: "⌛ Час схвалення минув — команду не виконано (час уже вичерпано або її вирішено в іншому місці)."
+    approval_poll_question: "Дозволити цю команду?"
   shared:
     truncated_suffix: "\n...(скорочено)"
     unknown: "невідомо"

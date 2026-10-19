@@ -6,8 +6,11 @@ import pytest
 
 from agent.i18n import t
 from gateway.config import PlatformConfig
+from gateway.platforms.base_exec_approval import ea_action_labels
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+from tools import approval, slash_confirm
 from tools import clarify_gateway as cg
+from tools.approval_gateway_wait import _ApprovalEntry
 
 PEER = '123@s.whatsapp.net'
 
@@ -17,11 +20,19 @@ class BridgeSession:
         self.posts = []
         self.status = 200
         self.missing_id = False
+        self.fail_paths = set()
 
     @asynccontextmanager
     async def post(self, url, *, json, **kwargs):
-        self.posts.append((url.rsplit('/', 1)[-1], json))
-        yield self
+        path = url.rsplit('/', 1)[-1]
+        self.posts.append((path, json))
+        saved = self.status
+        if path in self.fail_paths:
+            self.status = 500
+        try:
+            yield self
+        finally:
+            self.status = saved
 
     async def json(self):
         return {'messageId': None if self.missing_id else f'poll-{len(self.posts)}'}
@@ -38,13 +49,35 @@ def adapter(tmp_path, monkeypatch):
     }))
     instance._bridge_unavailable = AsyncMock(return_value=None)
     instance._http_session = BridgeSession()
-    with cg._lock:
-        cg._entries.clear()
-        cg._session_index.clear()
+    _reset_prompt_state()
     yield instance
+    _reset_prompt_state()
+
+
+def _reset_prompt_state():
     with cg._lock:
         cg._entries.clear()
         cg._session_index.clear()
+    with approval._lock:
+        approval._gateway_queues.clear()
+    with slash_confirm._lock:
+        slash_confirm._pending.clear()
+
+
+def _enqueue(request_id, command=None):
+    entry = _ApprovalEntry({
+        'command': command or f'cmd-{request_id}',
+        'description': 'cleanup',
+        'pattern_key': request_id,
+        'request_id': request_id,
+    })
+    with approval._lock:
+        approval._gateway_queues.setdefault('session', []).append(entry)
+    return entry
+
+
+def _poll_ids(adapter):
+    return [f'poll-{index}' for index, (path, _payload) in enumerate(adapter._http_session.posts, start=1) if path == 'send-poll']
 
 
 async def prompt(adapter, choices=None, multi=False, peer=PEER, cid='clarify'):
@@ -291,7 +324,7 @@ async def test_reserved_labels_use_sent_poll_language(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind,state_kind', [('clarify', 'approval'), ('approval', 'clarify'), ('approval', 'approval')])
+@pytest.mark.parametrize('kind,state_kind', [('clarify', 'approval'), ('approval', 'clarify'), ('choice', 'approval')])
 async def test_kind_state_mismatch_and_unimplemented_kind_are_consumed(adapter, kind, state_kind, caplog):
     from plugins.platforms.whatsapp.polls import ApprovalState
 
@@ -344,3 +377,217 @@ async def test_other_loses_to_typed_answer_atomically(adapter, monkeypatch, mult
     assert pid not in adapter._poll_bindings
     assert not entry.awaiting_text
     assert entry.response == ('["A"]' if multi else 'A')
+
+
+def test_whatsapp_supports_exec_approval_buttons():
+    assert WhatsAppAdapter.supports_exec_approval_buttons() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('choice', ['once', 'session', 'always', 'deny'])
+async def test_approval_label_resolves_that_choice_once(adapter, monkeypatch, choice):
+    calls = []
+    real = approval.resolve_gateway_approval
+
+    def spy(session_key, picked, resolve_all=False, reason=None, request_id=None):
+        calls.append((session_key, picked, request_id))
+        return real(session_key, picked, resolve_all=resolve_all, reason=reason, request_id=request_id)
+
+    monkeypatch.setattr(approval, 'resolve_gateway_approval', spy)
+    entry = _enqueue('req-1')
+    result = await adapter.send_exec_approval(PEER, 'rm -rf /tmp/x', 'session', request_id='req-1')
+    assert result.success
+    assert await vote(adapter, _poll_ids(adapter)[-1], [ea_action_labels()[choice]]) is None
+    assert calls == [('session', choice, 'req-1')]
+    assert entry.result == choice
+    reply = t('platform.whatsapp.denied' if choice == 'deny' else 'platform.whatsapp.approved')
+    assert adapter._http_session.posts[-1][1]['message'] == reply
+    count = len(adapter._http_session.posts)
+    assert await vote(adapter, _poll_ids(adapter)[-1], [ea_action_labels()[choice]]) is None
+    assert calls == [('session', choice, 'req-1')]
+    assert len(adapter._http_session.posts) == count
+
+
+@pytest.mark.asyncio
+async def test_approval_a_and_b_vote_resolves_only_a(adapter):
+    older = _enqueue('B', command='older-cmd')
+    newer = _enqueue('A', command='newer-cmd')
+    await adapter.send_exec_approval(PEER, 'older-cmd', 'session', request_id='B')
+    await adapter.send_exec_approval(PEER, 'newer-cmd', 'session', request_id='A')
+    b_poll, a_poll = _poll_ids(adapter)
+    assert await vote(adapter, a_poll, [ea_action_labels()['once']]) is None
+    assert newer.result == 'once'
+    assert older.result is None
+    assert [row['request_id'] for row in approval.list_gateway_approvals('session')] == ['B']
+    assert a_poll in adapter._retired_poll_ids
+    assert b_poll in adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+async def test_text_approve_then_poll_vote_expires_and_leaves_b(adapter):
+    first = _enqueue('A', command='cmd-a')
+    second = _enqueue('B', command='cmd-b')
+    await adapter.send_exec_approval(PEER, 'cmd-a', 'session', request_id='A')
+    await adapter.send_exec_approval(PEER, 'cmd-b', 'session', request_id='B')
+    a_poll, b_poll = _poll_ids(adapter)
+    assert approval.resolve_gateway_approval('session', 'once') == 1
+    assert first.result == 'once'
+    assert await vote(adapter, a_poll, [ea_action_labels()['once']]) is None
+    assert adapter._http_session.posts[-1][1]['message'] == t('platform.whatsapp.approval_expired')
+    assert second.result is None
+    assert [row['request_id'] for row in approval.list_gateway_approvals('session')] == ['B']
+    assert b_poll in adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('request_id', [None, ''])
+async def test_missing_request_id_falls_back(adapter, request_id):
+    result = await adapter.send_exec_approval(PEER, 'ls', 'session', request_id=request_id)
+    assert result.success is False
+    assert adapter._http_session.posts == []
+    assert not adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+async def test_group_approval_and_slash_confirm_fall_back(adapter):
+    approval_result = await adapter.send_exec_approval('123@g.us', 'ls', 'session', request_id='req')
+    confirm_result = await adapter.send_slash_confirm('123@g.us', 'Reload', 'Now?', 'session', 'confirm')
+    assert approval_result.success is False
+    assert confirm_result.success is False
+    assert adapter._http_session.posts == []
+    assert not adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+async def test_approval_message_id_is_the_text_message(adapter):
+    result = await adapter.send_exec_approval(PEER, 'ls', 'session', request_id='req')
+    text, poll = adapter._http_session.posts
+    assert result.success
+    assert text[0] == 'send' and poll[0] == 'send-poll'
+    assert result.message_id == 'poll-1'
+    assert result.message_id not in adapter._poll_bindings
+    assert 'poll-2' in adapter._poll_bindings
+    assert poll[1]['question'] == t('platform.whatsapp.approval_poll_question')
+    assert poll[1]['selectableCount'] == 1
+    assert poll[1]['options'] == [ea_action_labels()[choice] for choice in ('once', 'session', 'always', 'deny')]
+
+
+@pytest.mark.asyncio
+async def test_unauthorised_voter_cannot_approve(adapter):
+    entry = _enqueue('req')
+    await adapter.send_exec_approval(PEER, 'ls', 'session', request_id='req')
+    pid = _poll_ids(adapter)[-1]
+    assert await vote(adapter, pid, [ea_action_labels()['once']], voter='456@s.whatsapp.net') is None
+    assert entry.result is None
+    assert pid in adapter._poll_bindings
+    assert len(adapter._http_session.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_blank_or_multiple_approval_votes_do_not_resolve(adapter):
+    entry = _enqueue('req')
+    await adapter.send_exec_approval(PEER, 'ls', 'session', request_id='req')
+    pid = _poll_ids(adapter)[-1]
+    labels = ea_action_labels()
+    assert await vote(adapter, pid, []) is None
+    assert await vote(adapter, pid, [labels['once'], labels['deny']]) is None
+    assert entry.result is None
+    assert pid in adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+async def test_approval_text_failure_skips_the_poll(adapter):
+    adapter._http_session.fail_paths.add('send')
+    result = await adapter.send_exec_approval(PEER, 'ls', 'session', request_id='req')
+    assert result.success is False
+    assert [path for path, _payload in adapter._http_session.posts] == ['send']
+    assert not adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+async def test_approval_poll_failure_is_unsuccessful(adapter):
+    adapter._http_session.fail_paths.add('send-poll')
+    result = await adapter.send_exec_approval(PEER, 'ls', 'session', request_id='req')
+    assert result.success is False
+    assert [path for path, _payload in adapter._http_session.posts] == ['send', 'send-poll']
+    assert not adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('choice', ['once', 'always', 'cancel'])
+async def test_slash_confirm_choice_resolves_once(adapter, choice):
+    seen = []
+
+    async def handler(picked):
+        seen.append(picked)
+        return f'applied {picked}'
+
+    slash_confirm.register('session', 'confirm-1', 'reload-mcp', handler)
+    result = await adapter.send_slash_confirm(PEER, 'Reload', 'Reload MCP now?', 'session', 'confirm-1')
+    assert result.success and result.message_id == 'poll-1'
+    payload = adapter._http_session.posts[0][1]
+    assert payload['question'] == '*Reload*\n\nReload MCP now?'
+    assert payload['selectableCount'] == 1
+    assert payload['options'] == [
+        t('platform.whatsapp.slash_confirm_once'),
+        t('platform.whatsapp.slash_confirm_always'),
+        t('platform.whatsapp.slash_confirm_cancel'),
+    ]
+    label = t(f'platform.whatsapp.slash_confirm_{choice}')
+    assert await vote(adapter, result.message_id, [label]) is None
+    assert seen == [choice]
+    assert adapter._http_session.posts[-1][1]['message'] == f'applied {choice}'
+    assert slash_confirm.get_pending('session') is None
+    count = len(adapter._http_session.posts)
+    assert await vote(adapter, result.message_id, [label]) is None
+    assert seen == [choice]
+    assert len(adapter._http_session.posts) == count
+
+
+@pytest.mark.asyncio
+async def test_slash_confirm_without_reply_text_sends_nothing_more(adapter):
+    async def handler(_picked):
+        return None
+
+    slash_confirm.register('session', 'confirm-1', 'reload-mcp', handler)
+    result = await adapter.send_slash_confirm(PEER, 'Reload', 'Now?', 'session', 'confirm-1')
+    assert await vote(adapter, result.message_id, [t('platform.whatsapp.slash_confirm_cancel')]) is None
+    assert [path for path, _payload in adapter._http_session.posts] == ['send-poll']
+
+
+@pytest.mark.asyncio
+async def test_long_slash_confirm_sends_text_then_short_poll(adapter):
+    message = 'x' * 300
+    result = await adapter.send_slash_confirm(PEER, 'Title', message, 'session', 'confirm-1')
+    text, poll = adapter._http_session.posts
+    assert result.success and result.message_id == 'poll-2'
+    assert text[0] == 'send' and text[1]['message'] == f'_Title_\n\n{message}'
+    assert poll[0] == 'send-poll' and poll[1]['question'] == '*Title*'
+    assert len(poll[1]['question']) <= 255
+
+
+@pytest.mark.asyncio
+async def test_huge_slash_confirm_title_is_truncated(adapter):
+    result = await adapter.send_slash_confirm(PEER, 'T' * 300, 'body', 'session', 'confirm-1')
+    text, poll = adapter._http_session.posts
+    assert result.success
+    assert text[1]['message'] == f"_{'T' * 300}_\n\nbody"
+    assert poll[1]['question'] == ('*' + 'T' * 300 + '*')[:255]
+    assert len(poll[1]['question']) == 255
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('peer', [PEER, '123@g.us'])
+async def test_clarify_poll_strips_skip_hint(adapter, peer):
+    hint = t('gateway.clarify.skip_hint')
+    await adapter.send_clarify(peer, f'Choose?\n{hint}', ['A', 'B'], 'clarify', 'session')
+    assert adapter._http_session.posts[0][1]['question'] == 'Choose?'
+
+
+@pytest.mark.asyncio
+async def test_clarify_text_fallback_keeps_skip_hint(adapter):
+    hint = t('gateway.clarify.skip_hint')
+    question = f'Choose?\n{hint}'
+    await adapter.send_clarify(PEER, question, [str(index) for index in range(12)], 'clarify', 'session')
+    assert adapter._http_session.posts[0][0] == 'send'
+    assert hint in adapter._http_session.posts[0][1]['message']

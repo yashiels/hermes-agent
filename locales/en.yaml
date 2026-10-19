@@ -1025,6 +1025,7 @@ platform:
     approved: "✅ Approved."
     denied: "❌ Denied."
     approval_expired: "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)."
+    approval_poll_question: "Allow this command?"
   shared:
     truncated_suffix: "\n...(truncated)"
     unknown: "unknown"

@@ -979,6 +979,7 @@ platform:
     approved: "✅ 承認しました。"
     denied: "❌ 拒否しました。"
     approval_expired: "⌛ 承認の有効期限が切れました — コマンドは実行されませんでした（すでにタイムアウトしたか、別の場所で処理済みです）。"
+    approval_poll_question: "このコマンドを許可しますか？"
   shared:
     truncated_suffix: "\n...(省略)"
     unknown: "不明"
