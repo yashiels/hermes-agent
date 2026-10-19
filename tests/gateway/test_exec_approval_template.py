@@ -75,6 +75,15 @@ async def test_command_is_truncated_to_the_platform_budget():
     assert prompt.command == "x" * 100  # the raw command stays available for embeds/cards
 
 
+@pytest.mark.asyncio
+async def test_send_exec_approval_forwards_request_id():
+    adapter = _Buttons()
+    await adapter.send_exec_approval("chat", "ls", "sess", request_id="req-9")
+    assert adapter.prompts[0].request_id == "req-9"
+    await adapter.send_exec_approval("chat", "ls", "sess")
+    assert adapter.prompts[1].request_id is None
+
+
 def test_runner_only_offers_buttons_to_adapters_that_render_them():
     """Plain adapters get the text ``/approve`` prompt; the base send_exec_approval must not make
     the runner believe every adapter has buttons (its default reports failure and the runner would

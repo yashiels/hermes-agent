@@ -122,6 +122,19 @@ def test_timeout_falls_back_to_a_new_message_when_the_card_cannot_be_edited(pend
     assert "NOT run" in adapter.sends[-1]
 
 
+def test_approval_notify_forwards_request_id(pending_entry):
+    captured = {}
+
+    class _Capture(_ButtonAdapter):
+        async def send_exec_approval(self, *a, **k):
+            captured.update(k)
+            return await _ButtonAdapter.send_exec_approval(self, *a, **k)
+
+    _runner(_Capture())._approval_notify_sync(dict(pending_entry.data))
+    assert captured["request_id"] == pending_entry.data["request_id"]
+    assert captured["request_id"]
+
+
 @pytest.mark.parametrize("reason", ["answered", "interrupted", "notify_failed"])
 def test_other_settle_reasons_post_nothing(pending_entry, reason):
     adapter = _ButtonAdapter()
