@@ -21,6 +21,8 @@ from gateway.platforms.send_targets import StandaloneSendPolicy, regex_stripped_
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (find_node_executable, get_hermes_dir, with_hermes_node_path)
 
+from .polls import PollClarifyMixin
+
 _IS_WINDOWS = platform.system() == "Windows"
 
 
@@ -344,7 +346,7 @@ def _needs_bridge(method):
     return _guarded
 
 
-class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+class WhatsAppAdapter(PollClarifyMixin, WhatsAppBehaviorMixin, BasePlatformAdapter):
     """Transport over a local Node.js (Baileys) HTTP bridge; behavior lives in ``WhatsAppBehaviorMixin``. config.extra: bridge_script /
     bridge_port (3000) / session_path, dm_policy / group_policy (open|allowlist|disabled|pairing), allow_from / group_allow_from, send_read_receipts."""
 
@@ -373,6 +375,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._bridge_port = 3000
         self._bridge_script: str = extra.get("bridge_script", str(self._DEFAULT_BRIDGE_DIR / "bridge.js"))
         self._session_path = _session_dir(extra)
+        self._init_poll_bindings()
         self._reply_prefix: Optional[str] = extra.get("reply_prefix")
         self._dm_policy = str(_extra_or_secret(extra, "dm_policy", "WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         self._allow_from = self._coerce_allow_list(self._select_dm_allowlist(extra, ("WHATSAPP_ALLOWED_USERS",), _wenv))
@@ -837,17 +840,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         payload: dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "question": question, "options": list(options or []), "selectableCount": selectable_count}
         return await self._post_bridge_message("send-poll", payload, timeout=30)
 
-    async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,
-                           metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        """Multiple-choice clarify as a native poll (the pick arrives as message text for the normal intercept); else text prompt."""
-        clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
-        if 2 <= len(clean_choices) <= 12:
-            result = await self.send_poll(chat_id, str(question or "").strip(), clean_choices, selectable_count=1)
-            if result.success:
-                return result
-            logger.warning("[%s] Native WhatsApp clarify poll failed; falling back to text: %s", self.name, result.error)
-        return await super().send_clarify(chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id, session_key=session_key, metadata=metadata)
-
     @_needs_bridge
     async def send_location(self, chat_id: str, latitude: float, longitude: float, *, name: Optional[str] = None, address: Optional[str] = None,
                             reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -1028,6 +1020,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
             if not self._should_process_message(data):
+                return None
+            if await self._consume_poll_update(data):
                 return None
             msg_type = self._classify_bridge_message(data)
             source = self.build_source(chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="group" if data.get("isGroup", False) else "dm",

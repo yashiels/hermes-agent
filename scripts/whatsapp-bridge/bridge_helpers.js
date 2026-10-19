@@ -754,3 +754,52 @@ export function installConsoleStamps(target = console) {
 export function writeJsonLine(payload, stream = process.stdout) {
   stream.write(`${JSON.stringify(payload)}\n`);
 }
+
+export function serializePollRecord(id, chatId, payload, createdAt = Date.now()) {
+  const poll = payload?.poll;
+  if (!id || !chatId || !poll?.name || !poll.messageSecret) return null;
+  return { id, chatId, name: poll.name, values: poll.values, selectableCount: poll.selectableCount,
+    messageSecret: Buffer.from(poll.messageSecret).toString('base64'), createdAt };
+}
+
+export function prunePollRecords(records, now = Date.now()) {
+  const byId = new Map();
+  for (const record of records) {
+    if (!record || typeof record.id !== 'string' || !record.id
+      || typeof record.chatId !== 'string' || !record.chatId
+      || typeof record.name !== 'string' || !record.name
+      || !Array.isArray(record.values) || record.values.length < 2 || record.values.length > 12
+      || !record.values.every(value => typeof value === 'string' && value.trim())
+      || !Number.isInteger(record.selectableCount) || record.selectableCount < 1 || record.selectableCount > record.values.length
+      || typeof record.messageSecret !== 'string' || Buffer.from(record.messageSecret, 'base64').length !== 32
+      || !Number.isFinite(record.createdAt) || now - record.createdAt > 7 * 86400000) continue;
+    byId.set(record.id, record);
+  }
+  return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt).slice(-256);
+}
+
+export function parsePollRecords(text, now = Date.now()) {
+  const records = JSON.parse(text);
+  if (!Array.isArray(records)) throw new Error('Invalid poll store');
+  return prunePollRecords(records, now);
+}
+
+export function pollPayloadFromRecord(record) {
+  return { poll: { name: record.name, values: record.values, selectableCount: record.selectableCount,
+    messageSecret: Buffer.from(record.messageSecret, 'base64') } };
+}
+
+export function pollStoreEntry(id, chatId, payload) {
+  const message = pollCreationMessageFromPayload(payload);
+  return id && chatId && message ? { key: { id, remoteJid: chatId, fromMe: true }, message } : null;
+}
+
+export function rememberSentMessage(messageStore, sent, payload, chatId = sent?.key?.remoteJid) {
+  if (!sent?.key?.id) return;
+  if (payload?.poll) {
+    const entry = pollStoreEntry(sent.key.id, chatId, payload);
+    if (entry) messageStore.remember(entry);
+    return;
+  }
+  if (sent.message) messageStore.remember(sent);
+}

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Set
 
 from hermes_constants import get_hermes_dir
@@ -66,13 +67,13 @@ def normalize_whatsapp_mention_jid(value: str) -> str:
     )
 
 
-def expand_whatsapp_aliases(identifier: str) -> set[str]:
+def expand_whatsapp_aliases(identifier: str, session_dir: Path | None = None) -> set[str]:
     """All identifiers transitively reachable via the bridge's ``lid-mapping-*.json`` files;
     always includes the normalized input itself (empty set if it normalizes to empty)."""
     normalized = normalize_whatsapp_identifier(identifier)
     if not normalized:
         return set()
-    session_dir = get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
+    session_dir = Path(session_dir) if session_dir is not None else get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
     resolved: set[str] = set()
     queue = [normalized]
     while queue:

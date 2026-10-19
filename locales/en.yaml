@@ -1010,6 +1010,8 @@ platform:
     slash_confirm_once: "✅ Approve Once"
     slash_confirm_always: "🔒 Always"
     slash_confirm_cancel: "❌ Cancel"
+    clarify_done: "✅ Done"
+    clarify_other: "✏️ Other"
     clarify_type_answer: "✏️ Type your answer:"
     approved: "✅ Approved."
     denied: "❌ Denied."
