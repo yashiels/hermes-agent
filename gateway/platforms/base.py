@@ -1590,7 +1590,6 @@ class ExecApprovalPrompt:
     def choices(self) -> list[str]:
         return [choice for _, choice, _ in self.actions]
 
-
 @dataclass
 class SendResult:
     """Result of sending a message."""
