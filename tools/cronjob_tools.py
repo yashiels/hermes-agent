@@ -366,14 +366,10 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
             from hermes_constants import get_hermes_home, profile_name_for_home
 
             profile = profile_name_for_home(get_hermes_home())
-            adapters = runner._adapters_for_profile(profile)
-            # A credentialless shared-bot satellite borrows the primary's bot for ROUTED targets
-            # only — the same grant the ticker's ``tick_adapters_for`` makes, never the full map.
-            if getattr(runner, "_is_shared_bot_satellite", lambda _p: False)(profile):
-                from cron.scheduler_preflight import (
-                    SharedRouteAdapters, _primary_profile_routes_for_current_home)
+            from cron.scheduler_preflight import manual_cron_adapters
 
-                adapters = SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+            adapters = manual_cron_adapters(
+                runner, profile, runner._adapters_for_profile(profile))
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
         try:
             # run_one_job records last_run_at/last_status via mark_job_run; `job` is the
