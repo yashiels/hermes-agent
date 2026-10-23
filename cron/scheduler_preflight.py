@@ -192,23 +192,54 @@ def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
     )
 
 
-class SharedRouteAdapters:
-    """Read-only adapter map for a credentialless satellite profile. ``get(platform, target)``
-    resolves the PRIMARY adapter iff the inbound route matcher (``ProfileRoute.matches``) accepts
-    the target; anything else (unmatched target, disabled route, other profile, or target-less
-    ``get(platform)``) is a miss — fail closed, never the default bot.
+def _platform_key(platform) -> str:
+    return str(getattr(platform, "value", platform)).lower()
 
-    See #101113.
+
+def _adapter_for(mapping, platform):
+    if not mapping:
+        return None
+    if platform in mapping:
+        return mapping[platform]
+    key = _platform_key(platform)
+    for candidate, adapter in mapping.items():
+        if _platform_key(candidate) == key:
+            return adapter
+    return None
+
+
+def _borrows_unowned_platform(own, routes) -> bool:
+    owned = {_platform_key(key) for key in own}
+    return any(_platform_key(getattr(route, "platform", "")) not in owned for route in (routes or []))
+
+
+class SharedRouteAdapters:
+    """Per-platform adapter view for a satellite profile.
+
+    A platform the satellite owns resolves to its own adapter. A platform it does
+    not own resolves to the primary adapter only when ``ProfileRoute.matches``
+    accepts the target; anything else (unmatched target, disabled route, other
+    profile, or target-less ``get(platform)`` on an unowned platform) is a miss.
+    An empty own map is the credentialless view (#101113).
     """
 
-    def __init__(self, primary_adapters, routes) -> None:
+    def __init__(self, primary_adapters, routes, *, own_adapters=None) -> None:
         self._primary = dict(primary_adapters or {})
         self._routes = list(routes or [])
+        self._own = dict(own_adapters or {})
+
+    def owns(self, platform) -> bool:
+        return _adapter_for(self._own, platform) is not None
 
     def __bool__(self) -> bool:
+        if self._own:
+            return True
         return bool(self._primary) and bool(self._routes)
 
     def get(self, platform, target=None, default=None):
+        owned = _adapter_for(self._own, platform)
+        if owned is not None:
+            return owned
         if not target:
             return default
         adapter = self._primary.get(platform)
@@ -231,6 +262,38 @@ class SharedRouteAdapters:
             ):
                 return adapter
         return default
+
+
+def satellite_delivery_adapters(own_adapters, primary_adapters, routes):
+    own = own_adapters or {}
+    if not own:
+        return SharedRouteAdapters(primary_adapters, routes)
+    if _borrows_unowned_platform(own, routes):
+        return SharedRouteAdapters(primary_adapters, routes, own_adapters=own)
+    return own_adapters
+
+
+def manual_cron_adapters(runner, profile, resolved):
+    if not profile or profile == "default":
+        return resolved
+    primary_name = getattr(runner, "_primary_profile_name", None)
+    if primary_name and profile == primary_name:
+        return resolved
+    profile_map = getattr(runner, "_profile_adapters", None)
+    shared = bool(getattr(runner, "_is_shared_bot_satellite", lambda _profile: False)(profile))
+    if isinstance(profile_map, dict) and profile in profile_map:
+        own = profile_map.get(profile) or {}
+    elif shared:
+        own = {}
+    else:
+        return resolved
+    primary = getattr(runner, "adapters", None) or {}
+    routes = _primary_profile_routes_for_current_home()
+    if not own:
+        if not shared:
+            return resolved
+        return satellite_delivery_adapters({}, resolved or primary, routes)
+    return satellite_delivery_adapters(own, primary, routes)
 
 
 def _preflight_check_delivery(job: dict) -> Optional[str]:

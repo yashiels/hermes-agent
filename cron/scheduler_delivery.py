@@ -1158,7 +1158,7 @@ def _resolve_target_transport(
         # See #101113.
         shared = adapters.get(platform, target)
         target_adapters = {platform: shared} if shared is not None else {}
-        if shared is not None:
+        if shared is not None and not adapters.owns(platform):
             # The PRIMARY's route authorized this exact native adapter. The satellite's own
             # ``platforms.<p>`` block describes a connector it never runs (no credential), so
             # neither its absence nor ``enabled: false`` may veto the shared transport; only its
