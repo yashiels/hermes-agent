@@ -32,6 +32,23 @@ _MAX_DELEGATE_PROVENANCE_HOPS = 16
 class GatewayNotificationOwnershipMixin:
     """Ownership proof and route resolution for pinned async and process completions."""
 
+    def _process_notice_source(self, entry):
+        from gateway.config import Platform
+        from gateway.session_authorities import authority_for_home
+        from gateway.session_automation import committed_route_envelope
+        from gateway.session_envelope import restore_native_source
+
+        source = self._restored_source(entry)
+        if source.platform in (Platform.LOCAL, Platform.API_SERVER):
+            return source
+        authority = authority_for_home(self, self._resolve_profile_home_for_source(source))
+        if authority is None:
+            return source
+        envelope = committed_route_envelope(authority, entry)
+        if envelope is None:
+            return source
+        return restore_native_source({'native_text_v1': envelope}, self)
+
     async def _resolve_compression_lineage_target(
         self, session_db: Any, session_entry: Optional[SessionEntry], pinned_session_id: str,
     ) -> tuple[str, Optional[str]]:
