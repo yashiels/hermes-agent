@@ -36,7 +36,7 @@ _GIT_REF = re.compile(r"[A-Za-z0-9_./+*:~^{}-]+\Z")
 _UNSAFE_COMMAND_CONTROLS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 
-def command_segments(command: str, *, forbid_pipes: bool = False) -> list[list[str]] | None:
+def command_segments(command: str, *, forbid_pipes: bool = False, forbid_sequencing: bool = False) -> list[list[str]] | None:
     if _UNSAFE_COMMAND_CONTROLS.search(command):
         return None
     if not command.strip() or _command_parser_limit_exceeded(command):
@@ -66,7 +66,7 @@ def command_segments(command: str, *, forbid_pipes: bool = False) -> list[list[s
             operator *= 2
             j += 1
             skip = j
-        if operator == "&" or (forbid_pipes and operator == "|"):
+        if operator == "&" or (forbid_pipes and operator == "|") or (forbid_sequencing and operator != "&&"):
             return None
         previous = operator
         start = j
