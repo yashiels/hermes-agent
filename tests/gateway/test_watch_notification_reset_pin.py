@@ -2,10 +2,15 @@
 forever: the session authority refuses it ``admission_conflict`` on every drain tick (#141562).
 Real GatewayRunner, DiscordAdapter, SessionAuthority and drain over SQLite; no agent turn runs."""
 import asyncio
+import json
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 import logging
 import queue
 
 import pytest
+import pytest_asyncio
 
 from tests.module_clock import install_module_clock
 from tests.waiting import async_wait_until
@@ -293,3 +298,129 @@ async def test_foreign_pinned_completion_spends_nothing_across_restarts(monkeypa
         assert (row['delivery_state'], row['delivery_attempts']) == ('pending', 0)
     finally:
         authority.db.close()
+
+
+@pytest_asyncio.fixture
+async def satellite_gateway(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner, _profile_runtime_scope
+    from gateway.session_authorities import SessionAuthorities
+    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_identity import resolve_identity
+    from gateway.session_ingress_context import native_callback, register_transport_home
+    from hermes_state import SessionDB
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    launch = tmp_path / '.hermes'
+    home = launch / 'profiles' / 'jarvis'
+    home.mkdir(parents=True)
+    (home / 'config.yaml').write_text('{}')
+    (home / '.env').write_text('DISCORD_ALLOWED_USERS=42\n')
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(launch))
+    monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
+    config = GatewayConfig(multiplex_profiles=True)
+    config._runtime_profile_homes = [('default', launch), ('jarvis', home)]
+    runner = GatewayRunner(config)
+    runner._primary_profile_name = 'default'
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token='satellite-token', typing_indicator=False))
+    adapter.gateway_runner = runner
+    adapter.set_owner_profile('jarvis')
+    runner.adapters = {}
+    runner._profile_adapters = {'jarvis': {Platform.DISCORD: adapter}}
+    registry = runner.session_authorities = SessionAuthorities(launch, multiplexed=True)
+    monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
+    launch_authority = await initialize_session_authority(runner, profile_id=str(launch), instance_id='launch')
+    registry.add(launch, launch_authority, name='default')
+    db = SessionDB(home / 'state.db')
+    authority = await initialize_session_authority(runner, profile_id=str(home), instance_id='satellite',
+                                                 db=db, register=False)
+    registry.add(home, authority, name='jarvis')
+    register_transport_home(runner, 'jarvis', home)
+    source = adapter.build_source(chat_id='123', thread_id='123', chat_type='thread', user_id='42',
+                                  chat_name='initial thread')
+    source.profile = 'jarvis'
+    source.auto_thread_created = True
+    source.auto_thread_initial_name = 'initial thread'
+    try:
+        with _profile_runtime_scope(home):
+            for message_id, current in [('initial', source), ('later', replace(
+                    source, chat_name='renamed thread', auto_thread_created=False, auto_thread_initial_name=None))]:
+                resolve_identity(current, runner=runner, adapter=adapter, transport_profile='jarvis')
+                event = MessageEvent(text='start the build', source=current, message_id=message_id)
+                with native_callback(runner, event, home, profile='jarvis'):
+                    await authority.admit_native(event)
+        key = runner.session_store._generate_session_key(source)
+        entry = runner.session_store.lookup_by_session_key(key)
+        assert key == 'agent:jarvis:discord:thread:123:123'
+        assert entry.origin.chat_name == 'initial thread'
+        yield runner, authority, entry, home
+    finally:
+        db.close()
+        launch_authority.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['completion', 'watch_match', 'heartbeat'])
+async def test_satellite_thread_background_completion_is_admitted(satellite_gateway, tmp_path, monkeypatch, kind):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import process_registry as module
+    from tools.terminal_tool_background import spawn_background_process
+
+    runner, authority, entry, _home = satellite_gateway
+    monkeypatch.setattr(module, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    registry = module.ProcessRegistry()
+    monkeypatch.setattr(module, 'process_registry', registry)
+    tokens = set_session_vars(platform='discord', chat_type='thread', chat_id='123', thread_id='123',
+                              user_id='42', session_key=entry.session_key, session_id=entry.session_id, profile='jarvis')
+    try:
+        result = json.loads(spawn_background_process(
+            command='printf READY', env=SimpleNamespace(env={}), env_type='local',
+            effective_task_id='satellite-build', task_id='satellite-build', session_key=entry.session_key,
+            workdir=str(tmp_path), cwd=str(tmp_path), effective_pty=False, notify_on_complete=True,
+            watch_patterns=None, approval_note=None, pty_disabled_reason=None))
+    finally:
+        clear_session_vars(tokens)
+    assert result.get('error') is None, result
+    process = registry.get(result['session_id'])
+    await async_wait_until(lambda: process.exited, timeout=15, what='background process completion')
+    watcher = registry.pending_watchers.pop()
+    event = runner._build_process_completion_event(watcher, process, process.id)
+    if kind != 'completion':
+        event.update(type=kind, event_id=kind + '-1')
+    assert event['parent_session_id'] == entry.session_id
+    async with runner._completion_event_scope(event):
+        assert await runner._inject_watch_notification('build finished', event, raise_not_accepted=True) is True
+    from hermes_state_runtime import list_session_admissions
+    rows = list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False)
+    assert rows[-1]['principal_id'] == 'automation:' + entry.session_key
+    assert rows[-1]['status'] == 'queued'
+    assert rows[-1]['payload']['native_text_v1']['source']['chat_name'] == 'renamed thread'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('pin', ['reset', 'unrelated', 'foreign_profile'])
+async def test_satellite_thread_notice_keeps_session_pin_guards(satellite_gateway, pin):
+    from gateway.wake import WakeNotAccepted
+    from hermes_state_runtime import list_session_admissions
+
+    runner, authority, entry, _home = satellite_gateway
+    original = entry.session_id
+    if pin == 'reset':
+        runner.session_store.reset_session(entry.session_key)
+        parent = original
+    elif pin == 'unrelated':
+        authority.db.create_session('unrelated', source='discord')
+        runner.session_store.switch_session(entry.session_key, 'unrelated')
+        parent = original
+    else:
+        runner.session_authority.db.create_session('foreign', source='discord')
+        parent = 'foreign'
+    event = {'type': 'completion', 'session_id': 'proc-pinned', 'started_at': 1.0,
+             'session_key': entry.session_key, 'parent_session_id': parent}
+    async with runner._completion_event_scope(event):
+        with pytest.raises(WakeNotAccepted, match='admission_conflict'):
+            await runner._inject_watch_notification('build finished', event, raise_not_accepted=True)
+    assert not [row for row in list_session_admissions(authority.db, session_id=original, pending_only=False)
+                if row['principal_id'].startswith('automation:')]
