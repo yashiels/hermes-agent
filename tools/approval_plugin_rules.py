@@ -31,6 +31,7 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
     from tools import approval, approval_context
     from tools.approval_plugin_commands import command_segments, executable_name, gh_owner, git_local_command
 
+    from tools.approval_plugin_acpx import acpx_command_owner, acpx_exemption_policy
     from tools.approval_plugin_remote import remote_command_owner, remote_exemption_policy
 
     policy = approval_context._get_approval_config().get("plugin_rule_exemptions", {})
@@ -41,7 +42,8 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
     if blocked is not None:
         return blocked
     remote_policy = remote_exemption_policy(policy)
-    if remote_policy is None:
+    acpx_policy = acpx_exemption_policy(policy)
+    if remote_policy is None or acpx_policy is None:
         return None
     lists = [policy.get(key, []) for key in ("rule_keys", "plugins", "gh_owners")]
     if any(not isinstance(items, list) or any(not isinstance(item, str) for item in items) for items in lists):
@@ -55,6 +57,8 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
         return None
     if any(argv[0] == "ssh" for argv in segments) and command_segments(command, forbid_pipes=True) is None:
         return None
+    if any(argv[0] == "acpx" for argv in segments) and command_segments(command, forbid_sequencing=True) is None:
+        return None
     matched_owners = set()
     for argv in segments:
         executable = executable_name(argv[0])
@@ -65,6 +69,8 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
             matched_owners.add(owner)
         elif executable == "git" and policy.get("git_local") is True and git_local_command(argv):
             matched_owners.add("local")
+        elif argv[0] == "acpx" and (owner := acpx_command_owner(argv, acpx_policy, {owner.lower() for owner in owners})):
+            matched_owners.add(owner)
         else:
             remote_owner = remote_command_owner(argv, remote_policy)
             if remote_owner is None:
