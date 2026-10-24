@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ import discord
 
 from gateway.platforms.base import SendResult
 
+logger = logging.getLogger(__name__)
 
 _DISPLAY_LIMIT = 3800
 _TASK_LIMIT = 8
@@ -447,6 +449,7 @@ class CardState:
     coalescer: Optional[StatusCardCoalescer] = None
     refresh_task: Optional[asyncio.Task] = None
     history_nonce: Optional[str] = None
+    archive_recovery_attempted: bool = False
 
     def frame(self) -> StatusCardFrame:
         return StatusCardFrame(
@@ -454,3 +457,111 @@ class CardState:
             elapsed_s=max(self.elapsed_s, time.time() - self.started_at), iteration=self.iteration,
             max_iterations=self.max_iterations,
         )
+
+
+_COMPLETED_CARD_STATES = frozenset({"done", "failed"})
+_ARCHIVED_THREAD_CODE = 50083
+
+
+def preserved_terminal_outcome(state: str, requested: str) -> str:
+    if requested == "interrupted" and state in _COMPLETED_CARD_STATES:
+        return state
+    return requested
+
+
+def archived_thread_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    try:
+        if int(getattr(exc, "code", None)) == _ARCHIVED_THREAD_CODE:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "error code: 50083" in str(exc)
+
+
+def status_card_error_result(exc: BaseException) -> SendResult:
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status", None) or getattr(response, "status_code", None)
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = None
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = None
+    permanent = code == 50035 or status in {400, 403, 404}
+    return SendResult(
+        success=False, error=str(exc), raw_response=exc,
+        retryable=not permanent,
+    )
+
+
+async def unarchive_unlocked_thread(channel: Any) -> bool:
+    if channel is None or getattr(channel, "locked", False):
+        return False
+    edit = getattr(channel, "edit", None)
+    if not callable(edit):
+        return False
+    try:
+        await edit(archived=False)
+    except Exception:
+        logger.warning("Could not unarchive thread for a status card", exc_info=True)
+        return False
+    return True
+
+
+async def retry_after_unarchive(channel: Any, operation: Callable[[], Awaitable[Any]]) -> Any:
+    try:
+        return await operation()
+    except Exception as exc:
+        if not archived_thread_error(exc) or not await unarchive_unlocked_thread(channel):
+            raise
+        return await operation()
+
+
+def _channel_can_unarchive(channel: Any) -> bool:
+    return callable(getattr(channel, "edit", None))
+
+
+async def _channel_for_card(resolve_channel: Callable[[Any], Awaitable[Any]] | None, card: CardState) -> Any:
+    channel = getattr(card.message, "channel", None)
+    if _channel_can_unarchive(channel):
+        return channel
+    if resolve_channel is None:
+        return None
+    try:
+        return await resolve_channel(card.channel_id)
+    except Exception:
+        logger.warning("Could not resolve status-card channel %s", card.channel_id, exc_info=True)
+        return None
+
+
+async def retry_message_edit(
+    resolve_channel: Callable[[Any], Awaitable[Any]] | None, card: CardState, **kwargs: Any,
+) -> Any:
+    async def operation():
+        return await card.message.edit(**kwargs)
+
+    if card.archive_recovery_attempted:
+        return await operation()
+    channel = await _channel_for_card(resolve_channel, card)
+
+    async def unarchive_once() -> bool:
+        card.archive_recovery_attempted = True
+        return await unarchive_unlocked_thread(channel)
+
+    try:
+        return await operation()
+    except Exception as exc:
+        if not archived_thread_error(exc) or not await unarchive_once():
+            raise
+        return await operation()
+
+
+async def retry_channel_send(channel: Any, view: Any) -> Any:
+    return await retry_after_unarchive(channel, lambda: channel.send(view=view))

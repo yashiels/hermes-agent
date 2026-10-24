@@ -4612,24 +4612,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
     @staticmethod
     def _status_card_error_result(exc: BaseException) -> SendResult:
-        code = getattr(exc, "code", None)
-        status = getattr(exc, "status", None)
-        response = getattr(exc, "response", None)
-        if status is None and response is not None:
-            status = getattr(response, "status", None) or getattr(response, "status_code", None)
-        try:
-            code = int(code)
-        except (TypeError, ValueError):
-            code = None
-        try:
-            status = int(status)
-        except (TypeError, ValueError):
-            status = None
-        permanent = code == 50035 or status in {400, 403, 404}
-        return SendResult(
-            success=False, error=str(exc), raw_response=exc,
-            retryable=not permanent,
-        )
+        from plugins.platforms.discord.status_card import status_card_error_result
+        return status_card_error_result(exc)
 
     @staticmethod
     def _status_card_permanent_failure(result: SendResult) -> bool:
@@ -4639,13 +4623,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         }
 
     async def _edit_status_card_frame(self, card: CardState, frame: StatusCardFrame) -> SendResult:
+        from plugins.platforms.discord.status_card import retry_message_edit
         try:
             view = StatusCardView(
                 frame.tasks, nonce=card.nonce, title=frame.title, state=frame.state,
                 elapsed_s=frame.elapsed_s, iteration=frame.iteration,
                 max_iterations=frame.max_iterations, history_nonce=frame.history_nonce,
             )
-            await card.message.edit(view=view)
+            await retry_message_edit(self._resolve_channel, card, view=view)
             return SendResult(success=True, message_id=str(card.message.id))
         except Exception as exc:
             logger.debug("[Discord] Status-card transport failed", exc_info=True)
@@ -4838,7 +4823,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 await self._stop_status_card_refresh(card)
                 if card.coalescer is not None:
                     await card.coalescer.close()
-                card.state = outcome
+                from plugins.platforms.discord.status_card import (
+                    archived_thread_error, preserved_terminal_outcome, retry_message_edit,
+                )
+                card.state = preserved_terminal_outcome(card.state, outcome)
                 card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
                 finished_at = time.time()
                 history_nonce = await self._record_status_card_history(card, finished_at)
@@ -4850,6 +4838,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     if result.success:
                         terminal_succeeded = True
                         break
+                    if archived_thread_error(getattr(result, "raw_response", None)):
+                        break
                     logger.warning(
                         "[Discord] Status-card terminal edit attempt %d/3 failed for %s: %s",
                         attempt + 1, card.nonce, result.error or "unknown failure",
@@ -4860,7 +4850,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 controls_removed = False
                 if not terminal_succeeded:
                     try:
-                        await card.message.edit(view=None)
+                        await retry_message_edit(self._resolve_channel, card, view=None)
                         controls_removed = True
                     except Exception as exc:
                         logger.warning(
@@ -4873,7 +4863,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         notice_metadata["thread_id"] = card.thread_key
                     try:
                         notice = await self.send(
-                            card.chat_id, f"-# run {outcome} · status card could not be updated",
+                            card.chat_id, f"-# run {card.state} · status card could not be updated",
                             metadata=notice_metadata,
                         )
                         notice_succeeded = bool(notice.success)
@@ -5026,7 +5016,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     tasks, nonce=run["nonce"], title=title or "Hermes run", state="running",
                     elapsed_s=0.0, iteration=0, max_iterations=0,
                 )
-                message = await channel.send(view=view)
+                from plugins.platforms.discord.status_card import retry_channel_send
+                message = await retry_channel_send(channel, view)
             except Exception as exc:
                 logger.debug("[Discord] Status-card transport failed", exc_info=True)
                 return self._status_card_error_result(exc)
