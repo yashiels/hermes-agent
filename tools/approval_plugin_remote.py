@@ -25,7 +25,7 @@ def canonical_path(value: str) -> str | None:
         return None
     try:
         return os.path.realpath(os.path.expanduser(value))
-    except (OSError, ValueError):
+    except (OSError, ValueError, UnicodeError):
         return None
 
 
