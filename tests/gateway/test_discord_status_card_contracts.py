@@ -145,7 +145,7 @@ def test_generic_native_card_gate_accepts_discord_and_keeps_explicit_off():
     [
         ("done", False, True, "done"),
         ("failed", False, True, "failed"),
-        ("done", True, True, "interrupted"),
+        ("done", True, True, "done"),
         ("done", False, False, "failed"),
     ],
 )

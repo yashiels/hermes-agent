@@ -1416,6 +1416,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._status_card_persisted: dict[str, dict[str, Any]] = {}
         self._status_message_ids: dict[tuple[str, str, int, str], str] = {}
         self._ended_status_runs: OrderedDict[tuple[str, int], None] = OrderedDict()
+        self._ended_status_nonces: OrderedDict[str, str] = OrderedDict()
         self._last_final_messages: OrderedDict[str, str] = OrderedDict()
         self._reaction_registry = ReactionControlRegistry()
         self._status_card_persistence_lock = asyncio.Lock()
@@ -2242,6 +2243,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        await self._cancel_card_hook_tasks()
         # Cancel the liveness probe first so it can't fire a spurious fatal/reconnect mid-teardown.
         await self._cancel_liveness_task()
         # Leave voice *before* cancelling the bot task: VoiceClient.disconnect() needs the main
@@ -4660,6 +4662,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         try:
             while True:
                 await asyncio.sleep(self._status_card_refresh_interval)
+                outcome = self._ended_status_nonces.get(card.nonce)
+                if outcome is not None:
+                    await self._terminalize_card_once(
+                        card, outcome=outcome, metadata=card.delivery_metadata,
+                    )
+                    return
                 async with card.lock:
                     key = (card.chat_id, card.thread_key)
                     if (
@@ -4770,7 +4778,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self, card: CardState, *, send_fallback: bool, result: Optional[SendResult] = None,
     ) -> None:
         async with card.lock:
-            if card.terminal_completed or card.terminalizing:
+            if card.terminal_completed or card.terminal_attempted or card.terminalizing:
                 return
             card.terminalizing = True
             try:
@@ -4816,8 +4824,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self, card: CardState, *, outcome: str, metadata: Optional[dict[str, Any]],
     ) -> bool:
         async with card.lock:
-            if card.terminal_completed:
-                return True
+            if card.terminal_attempted or card.terminal_completed:
+                return card.terminal_completed
+            card.terminal_attempted = True
             card.terminalizing = True
             try:
                 await self._stop_status_card_refresh(card)
@@ -4827,6 +4836,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     archived_thread_error, preserved_terminal_outcome, retry_message_edit,
                 )
                 card.state = preserved_terminal_outcome(card.state, outcome)
+                self._record_ended_status_nonce(card.nonce, card.state)
                 card.elapsed_s = max(card.elapsed_s, time.time() - card.started_at)
                 finished_at = time.time()
                 history_nonce = await self._record_status_card_history(card, finished_at)
@@ -4871,11 +4881,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
                 completed = terminal_succeeded or controls_removed or notice_succeeded
                 if completed:
-                    await self._compare_pop_status_card(card)
                     await self._remove_status_card_persistence(card)
                     card.terminal_completed = True
                 return completed
             finally:
+                await self._compare_pop_status_card(card)
                 card.terminalizing = False
 
     def _read_status_card_entries(self) -> list[dict[str, Any]]:
@@ -4939,17 +4949,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
     async def _sweep_orphaned_status_cards(self, ended_nonce: str) -> None:
         for card in list(self._status_cards.values()):
-            if card.nonce == ended_nonce or self._status_card_run_is_current(
-                card.session_key, card.generation,
-            ):
+            outcome = self._ended_status_nonces.get(card.nonce)
+            if outcome is None:
                 continue
             await self._terminalize_card_once(
-                card, outcome="interrupted", metadata=card.delivery_metadata,
+                card, outcome=outcome, metadata=card.delivery_metadata,
             )
         live_nonces = set(self._status_card_keys_by_nonce)
         changed = False
         for nonce, entry in list(self._status_card_persisted.items()):
-            if nonce in live_nonces:
+            if nonce in live_nonces or nonce in self._ended_status_nonces:
                 continue
             session_key = str(entry.get("session_key") or "")
             try:
@@ -5103,6 +5112,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             )
         return bool(result.success)
 
+    @staticmethod
+    def _log_status_card_run_mismatch(card: CardState, run: dict[str, Any]) -> None:
+        if (card.session_key, card.generation) != (run["session_key"], run["generation"]):
+            logger.info(
+                "[Discord] Status-card run mismatch nonce=%s card=(%s, %s) run=(%s, %s)",
+                card.nonce, card.session_key, card.generation, run["session_key"], run["generation"],
+            )
+
     async def finalize_native_task_card(
         self, chat_id: str, *, outcome: str, reply_to: Optional[str],
         metadata: Optional[dict[str, Any]],
@@ -5112,9 +5129,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return False
         key = self._status_card_keys_by_nonce.get(run["nonce"])
         card = self._status_cards.get(key) if key is not None else None
-        if card is None or card.generation != run["generation"] or card.session_key != run["session_key"]:
+        if card is None:
             return False
+        self._log_status_card_run_mismatch(card, run)
         return await self._terminalize_card_once(card, outcome=outcome, metadata=metadata)
+
+    def _record_ended_status_nonce(self, nonce: str, outcome: str) -> None:
+        self._ended_status_nonces[nonce] = outcome
+        self._ended_status_nonces.move_to_end(nonce)
+        while len(self._ended_status_nonces) > 200:
+            self._ended_status_nonces.popitem(last=False)
 
     async def on_turn_end(
         self, chat_id: str, *, metadata: Optional[dict[str, Any]], outcome: str,
@@ -5122,6 +5146,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         run = self._hermes_run(metadata)
         if run is None:
             return
+        self._record_ended_status_nonce(run["nonce"], outcome)
         self._reaction_registry.clear_run(run["session_key"], run["generation"])
         ended_key = (run["session_key"], run["generation"])
         self._ended_status_runs[ended_key] = None
@@ -5134,7 +5159,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 self._status_message_ids.pop(status_key, None)
         key = self._status_card_keys_by_nonce.get(run["nonce"])
         card = self._status_cards.get(key) if key is not None else None
-        if card is not None and card.generation == run["generation"] and card.session_key == run["session_key"]:
+        if card is not None:
+            self._log_status_card_run_mismatch(card, run)
             await self._terminalize_card_once(card, outcome=outcome, metadata=metadata)
         await self._sweep_orphaned_status_cards(run["nonce"])
 

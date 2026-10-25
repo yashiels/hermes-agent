@@ -444,12 +444,12 @@ class CardState:
     delivery_metadata: dict[str, Any] = field(default_factory=dict)
     fallback_sent: bool = False
     terminal_completed: bool = False
+    terminal_attempted: bool = False
     terminalizing: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     coalescer: Optional[StatusCardCoalescer] = None
     refresh_task: Optional[asyncio.Task] = None
     history_nonce: Optional[str] = None
-    archive_recovery_attempted: bool = False
 
     def frame(self) -> StatusCardFrame:
         return StatusCardFrame(
@@ -547,18 +547,13 @@ async def retry_message_edit(
     async def operation():
         return await card.message.edit(**kwargs)
 
-    if card.archive_recovery_attempted:
-        return await operation()
-    channel = await _channel_for_card(resolve_channel, card)
-
-    async def unarchive_once() -> bool:
-        card.archive_recovery_attempted = True
-        return await unarchive_unlocked_thread(channel)
-
     try:
         return await operation()
     except Exception as exc:
-        if not archived_thread_error(exc) or not await unarchive_once():
+        if not archived_thread_error(exc):
+            raise
+        channel = await _channel_for_card(resolve_channel, card)
+        if not await unarchive_unlocked_thread(channel):
             raise
         return await operation()
 

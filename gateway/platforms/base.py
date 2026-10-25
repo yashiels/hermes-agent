@@ -1951,6 +1951,7 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
+        self._card_hook_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
         self._owner_profile: Optional[str] = None
@@ -4477,18 +4478,6 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
-        _post_cb = self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
-        if callable(_post_cb):
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                _post_result = _post_cb()
-                if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
-
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
         drop: re-queue it if another task already owns the session (drain handoff), else spawn the
@@ -4531,6 +4520,7 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
             _thread_metadata["hermes_run"] = dict(event._hermes_run)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         response = None
+        propagating_cancellation, hook_cancellation = False, None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
@@ -4619,10 +4609,12 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            event._hermes_turn_outcome = "interrupted"
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
+            propagating_cancellation = True
             raise
         except BaseException as e:
             if isinstance(getattr(event, "_hermes_run", None), dict):
@@ -4634,15 +4626,21 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            card_hook_task = asyncio.create_task(self._finish_card_with_deadline(
+                event, session_key, interrupt_event, _thread_metadata,
+                delivery_attempted, delivery_succeeded,
+            ))
+            self._card_hook_task_set().add(card_hook_task)
+            card_hook_task.add_done_callback(self._card_hook_done)
+            try:
+                await asyncio.shield(card_hook_task)
+            except asyncio.CancelledError as exc:
+                hook_cancellation = None if propagating_cancellation else exc
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._run_gateway_turn_end_hooks(
-                event, session_key, interrupt_event, _thread_metadata,
-                delivery_attempted, delivery_succeeded,
-            )
             await self._fire_post_delivery_callback(session_key, interrupt_event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
@@ -4650,6 +4648,8 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if hook_cancellation is not None:
+                raise hook_cancellation
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot

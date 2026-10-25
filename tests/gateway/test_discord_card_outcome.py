@@ -54,6 +54,7 @@ async def test_normal_completion_stays_done_after_orphan_sweep(tmp_path, monkeyp
     preliminary = _outcome(runner, token["session_key"], generation, agent_result)
     assert preliminary == "done"
     await _open_card(adapter, metadata)
+    card = next(iter(adapter._status_cards.values()))
     channel.message.failures = [ConnectionError("offline")] * 12
     adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline", retryable=True))
     event = _event(metadata)
@@ -62,14 +63,16 @@ async def test_normal_completion_stays_done_after_orphan_sweep(tmp_path, monkeyp
     await adapter._run_gateway_turn_end_hooks(
         event, token["session_key"], asyncio.Event(), metadata, True, True,
     )
-    card = next(iter(adapter._status_cards.values()))
     assert card.state == "done"
     assert card.terminal_completed is False
+    edits = len(channel.message.edits)
     channel.message.failures.clear()
 
     await adapter._sweep_orphaned_status_cards("other-nonce")
 
-    assert view_texts(channel.message.edits[-1]["view"])[0] == "**Done**"
+    assert len(channel.message.edits) == edits
+    assert card.state == "done"
+    assert not adapter._status_cards
 
 
 @pytest.mark.asyncio
@@ -109,6 +112,7 @@ async def test_failed_run_stays_failed_after_orphan_sweep(tmp_path, monkeypatch)
     preliminary = _outcome(runner, token["session_key"], generation, agent_result)
     assert preliminary == "failed"
     await _open_card(adapter, metadata)
+    card = next(iter(adapter._status_cards.values()))
     channel.message.failures = [ConnectionError("offline")] * 12
     adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline", retryable=True))
     event = _event(metadata)
@@ -117,13 +121,15 @@ async def test_failed_run_stays_failed_after_orphan_sweep(tmp_path, monkeypatch)
     await adapter._run_gateway_turn_end_hooks(
         event, token["session_key"], asyncio.Event(), metadata, True, False,
     )
-    card = next(iter(adapter._status_cards.values()))
     assert card.state == "failed"
+    edits = len(channel.message.edits)
     channel.message.failures.clear()
 
     await adapter._sweep_orphaned_status_cards("other-nonce")
 
-    assert view_texts(channel.message.edits[-1]["view"])[0] == "**Failed**"
+    assert len(channel.message.edits) == edits
+    assert card.state == "failed"
+    assert not adapter._status_cards
 
 
 @pytest.mark.asyncio

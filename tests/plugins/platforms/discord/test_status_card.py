@@ -469,7 +469,7 @@ async def test_old_finalize_cannot_pop_new_card(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_supersession_keeps_old_card_and_aborts_replacement(
+async def test_failed_supersession_keeps_persistence_and_aborts_replacement(
     tmp_path, monkeypatch, caplog,
 ):
     channel = FakeChannel(new_message_each_send=True)
@@ -487,8 +487,8 @@ async def test_failed_supersession_keeps_old_card_and_aborts_replacement(
     )
 
     assert result == SendResult(success=False, error="superseded card not terminalized")
-    key = adapter._status_card_keys_by_nonce["1111111111111111"]
-    assert adapter._status_cards[key].nonce == "1111111111111111"
+    assert "1111111111111111" not in adapter._status_card_keys_by_nonce
+    assert not adapter._status_cards
     assert "2222222222222222" not in adapter._status_card_keys_by_nonce
     assert len(channel.sends) == 1
     persisted = json.loads(adapter._status_card_persistence_path.read_text())
@@ -1053,7 +1053,7 @@ async def test_reconnect_reconciliation_skips_live_card(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_turn_end_sweeps_orphans_without_touching_current_cards(tmp_path, monkeypatch):
+async def test_turn_end_reconciles_persisted_orphans_without_stopping_live_cards(tmp_path, monkeypatch):
     channel = FakeChannel(new_message_each_send=True)
     adapter, _channel = make_adapter(tmp_path, monkeypatch, channel=channel)
     orphan = run_metadata(
@@ -1088,12 +1088,12 @@ async def test_turn_end_sweeps_orphans_without_touching_current_cards(tmp_path, 
 
     await adapter.on_turn_end("channel-1", metadata=ended, outcome="done")
 
-    assert "interrupted" in view_texts(orphan_message.edits[-1]["view"])[1]
+    assert orphan_message.edits == []
     assert current_message.edits == []
     assert "running" in view_texts(channel.sends[1]["view"])[1]
     assert "gateway restarted" in view_texts(persisted_message.edits[-1]["view"])[1]
-    assert set(adapter._status_card_keys_by_nonce) == {"2222222222222222"}
-    assert set(adapter._status_card_persisted) == {"2222222222222222"}
+    assert set(adapter._status_card_keys_by_nonce) == {"1111111111111111", "2222222222222222"}
+    assert set(adapter._status_card_persisted) == {"1111111111111111", "2222222222222222"}
 
 
 @pytest.mark.asyncio

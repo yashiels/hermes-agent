@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 from typing import Any, Optional
@@ -11,6 +12,43 @@ logger = logging.getLogger("gateway.platforms.base")
 
 
 class PlatformRunControlsMixin:
+    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
+        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
+        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
+        would let stale runs fire a fresher run's callbacks."""
+        from gateway.platforms.base import _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS
+
+        _post_cb = self.pop_post_delivery_callback(
+            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+        if callable(_post_cb):
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                _post_result = _post_cb()
+                if inspect.isawaitable(_post_result):
+                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+
+    async def _finish_card_with_deadline(self, *args: Any) -> None:
+        try:
+            await asyncio.wait_for(self._run_gateway_turn_end_hooks(*args), timeout=5.0)
+        except Exception:
+            logger.warning("[%s] Turn-end card hook failed or timed out", self.name, exc_info=True)
+
+    def _card_hook_task_set(self) -> set[asyncio.Task]:
+        tasks = getattr(self, "_card_hook_tasks", None)
+        if tasks is None:
+            self._card_hook_tasks = tasks = set()
+        return tasks
+
+    def _card_hook_done(self, task: asyncio.Task) -> None:
+        self._card_hook_task_set().discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _cancel_card_hook_tasks(self) -> None:
+        tasks = list(self._card_hook_task_set())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _run_gateway_turn_end_hooks(
         self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
         metadata: Optional[dict[str, Any]], delivery_attempted: bool, delivery_succeeded: bool,
@@ -23,7 +61,9 @@ class PlatformRunControlsMixin:
         hook_metadata["hermes_run"] = dict(hermes_run)
         preliminary = getattr(event, "_hermes_turn_outcome", "failed")
         outcome = (
-            "interrupted"
+            "done"
+            if preliminary == "done" and delivery_attempted and delivery_succeeded
+            else "interrupted"
             if interrupt_event.is_set() or preliminary == "interrupted"
             else "failed"
             if preliminary == "failed" or (delivery_attempted and not delivery_succeeded)

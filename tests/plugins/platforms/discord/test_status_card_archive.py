@@ -203,7 +203,7 @@ async def test_partial_message_channel_unarchives_resolved_thread(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_terminal_archive_recovery_happens_once(tmp_path, monkeypatch):
+async def test_terminal_archive_recovery_happens_once_per_edit(tmp_path, monkeypatch):
     channel = UnarchiveOnceChannel()
     adapter, _channel = make_adapter(tmp_path, monkeypatch, channel=channel)
     metadata = await _open_card(adapter)
@@ -213,7 +213,7 @@ async def test_terminal_archive_recovery_happens_once(tmp_path, monkeypatch):
         "channel-1", outcome="done", reply_to=None, metadata=metadata,
     ) is True
 
-    assert channel.unarchive_calls == 1
+    assert channel.unarchive_calls == 2
     assert adapter.send.await_args.args[1] == "-# run done · status card could not be updated"
     assert not adapter._status_cards
     assert json.loads(adapter._status_card_persistence_path.read_text()) == []
