@@ -4626,12 +4626,10 @@ class BasePlatformAdapter(PlatformRunControlsMixin, ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
-            card_hook_task = asyncio.create_task(self._finish_card_with_deadline(
+            card_hook_task = self._start_card_hook_task(
                 event, session_key, interrupt_event, _thread_metadata,
                 delivery_attempted, delivery_succeeded,
-            ))
-            self._card_hook_task_set().add(card_hook_task)
-            card_hook_task.add_done_callback(self._card_hook_done)
+            )
             try:
                 await asyncio.shield(card_hook_task)
             except asyncio.CancelledError as exc:

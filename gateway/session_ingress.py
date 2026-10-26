@@ -80,15 +80,21 @@ async def admit_message(authority, event):
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
         return None if status == 'terminal' else pause_notice(authority, receipt.ref, 'unknown_execution')
+    from gateway.session_run_lifecycle import bind_delivery_owner, cancel_delivery_owner, release_delivery_owner
+    run_owner = bind_delivery_owner(authority, receipt.admission_id, event, waiter)
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
         return await asyncio.shield(waiter)
+    except asyncio.CancelledError:
+        cancel_delivery_owner(run_owner, event)
+        raise
     except RuntimeStoreError as exc:
         return pause_notice(authority, receipt.ref, exc.reason)
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+        release_delivery_owner(authority, receipt.admission_id, run_owner)
 
 
 def _marker_adopters(authority):
@@ -279,6 +285,7 @@ async def execute_admission(authority, ref, row):
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
+    cancelled = False
     try:
         with await _execution_scope(authority, home):
             if is_api:
@@ -325,14 +332,20 @@ async def execute_admission(authority, ref, row):
             handed = True
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
+    except asyncio.CancelledError:
+        cancelled = True
+        event._hermes_turn_outcome = 'interrupted'
+        raise
     finally:
-        if not handed:
-            await _release_turn_marker(authority, event)
-        executing_admission.reset(token)
-        execution_result.reset(result_token)
-        api_execution.reset(api_token)
-        admission_author.reset(author_token)
-        viewer_turn.reset(viewer_token)
+        from gateway.session_run_lifecycle import finish_execution
+        try:
+            await finish_execution(authority, row['admission_id'], event, home, handed=handed, cancelled=cancelled)
+        finally:
+            executing_admission.reset(token)
+            execution_result.reset(result_token)
+            api_execution.reset(api_token)
+            admission_author.reset(author_token)
+            viewer_turn.reset(viewer_token)
 
 
 def _launch_body_if_launch_owner(authority):
@@ -371,6 +384,14 @@ async def _execution_scope(authority, home):
 
 
 async def deliver_settled(authority, admission_id):
+    from gateway.session_run_lifecycle import settle_run
+    try:
+        await _deliver_settled_response(authority, admission_id)
+    finally:
+        await settle_run(authority, admission_id)
+
+
+async def _deliver_settled_response(authority, admission_id):
     """Send a recovered no-waiter turn's reply after its terminal outcome committed. A send
     failure cannot rewrite that outcome; it is logged, and inference never runs again."""
     held = _held_markers(authority).pop(admission_id, None)
@@ -404,13 +425,28 @@ async def deliver_settled(authority, admission_id):
 
 
 async def deliver_response(adapter, event, session_key, response):
+    from gateway.session_run_lifecycle import finish_delivery
+    results = []
+    try:
+        await _deliver_response(adapter, event, session_key, response, results)
+    except asyncio.CancelledError:
+        event._hermes_turn_outcome = 'interrupted'
+        raise
+    except Exception:
+        if isinstance(getattr(event, '_hermes_run', None), dict):
+            event._hermes_turn_outcome = 'failed'
+        raise
+    finally:
+        await finish_delivery(adapter, event, session_key, bool(results), any(getattr(result, 'success', False) for result in results))
+
+
+async def _deliver_response(adapter, event, session_key, response, results):
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
     text, ttl = adapter._unwrap_ephemeral(response)
     if not text:
         return
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
-    results = []
     if extracted.text_content:
         await adapter._send_final_text(event, session_key, extracted.text_content,
                                        metadata, ttl > 0, ttl, results.append)
@@ -440,6 +476,8 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             response = await adapter._message_handler(event)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
+            from gateway.session_run_lifecycle import copy_run_context
+            copy_run_context(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
             await deliver_response(adapter, delivery_event, session_key, response)
         except Exception as exc:

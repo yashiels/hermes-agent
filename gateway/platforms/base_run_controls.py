@@ -32,6 +32,12 @@ class PlatformRunControlsMixin:
         except Exception:
             logger.warning("[%s] Turn-end card hook failed or timed out", self.name, exc_info=True)
 
+    def _start_card_hook_task(self, *args: Any) -> asyncio.Task:
+        task = asyncio.create_task(self._finish_card_with_deadline(*args))
+        self._card_hook_task_set().add(task)
+        task.add_done_callback(self._card_hook_done)
+        return task
+
     def _card_hook_task_set(self) -> set[asyncio.Task]:
         tasks = getattr(self, "_card_hook_tasks", None)
         if tasks is None:
@@ -56,6 +62,9 @@ class PlatformRunControlsMixin:
         from gateway.platforms.base import _reply_anchor_for_event
         hermes_run = getattr(event, "_hermes_run", None)
         if not isinstance(hermes_run, dict) or not self._gateway_run_controls_enabled(self):
+            return
+        from gateway.session_run_lifecycle import claim_run
+        if not claim_run(event):
             return
         hook_metadata = dict(metadata or {})
         hook_metadata["hermes_run"] = dict(hermes_run)
