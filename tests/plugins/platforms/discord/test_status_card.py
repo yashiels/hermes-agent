@@ -511,13 +511,38 @@ async def test_failed_supersession_keeps_persistence_and_aborts_replacement(
     )
 
     assert result == SendResult(success=False, error="superseded card not terminalized")
-    assert "1111111111111111" not in adapter._status_card_keys_by_nonce
-    assert not adapter._status_cards
+    key = adapter._status_card_keys_by_nonce["1111111111111111"]
+    old_card = adapter._status_cards[key]
+    assert old_card.nonce == "1111111111111111"
     assert "2222222222222222" not in adapter._status_card_keys_by_nonce
     assert len(channel.sends) == 1
     persisted = json.loads(adapter._status_card_persistence_path.read_text())
     assert {entry["nonce"] for entry in persisted} == {"1111111111111111"}
     assert "restart reconciliation will retry" in caplog.text
+
+    channel.message.failures = [ConnectionError("offline") for _ in range(4)]
+    result = await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "2", "title": "New", "status": "running"}], metadata=new,
+    )
+    assert result == SendResult(success=False, error="superseded card not terminalized")
+    assert adapter._status_cards[key] is old_card
+    assert adapter._status_card_keys_by_nonce[old_card.nonce] == key
+    assert len(channel.sends) == 1
+    persisted = json.loads(adapter._status_card_persistence_path.read_text())
+    assert {entry["nonce"] for entry in persisted} == {old_card.nonce}
+
+    channel.message.failures.clear()
+    result = await adapter.send_native_task_card_progress(
+        "channel-1", [{"id": "2", "title": "New", "status": "running"}], metadata=new,
+    )
+    assert result.success
+    assert old_card.terminal_completed
+    assert adapter._status_cards[key].nonce == "2222222222222222"
+    assert old_card.nonce not in adapter._status_card_keys_by_nonce
+    assert len(channel.sends) == 2
+    persisted = json.loads(adapter._status_card_persistence_path.read_text())
+    assert {entry["nonce"] for entry in persisted} == {"2222222222222222"}
+    await adapter._stop_status_card_refresh(adapter._status_cards[key])
 
 
 @pytest.mark.asyncio

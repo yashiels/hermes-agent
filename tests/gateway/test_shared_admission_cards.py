@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import suppress
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -390,6 +391,69 @@ async def test_late_waiter_does_not_claim_the_settled_delivery_card(tmp_path, mo
         with suppress(asyncio.CancelledError):
             await parent
         await drain_owner(authority)
+        for card in cards:
+            await adapter._stop_status_card_refresh(card)
+        await adapter._cancel_card_hook_tasks()
+
+
+@pytest.mark.asyncio
+async def test_busy_observer_final_reply_records_run_and_accepts_retry(tmp_path, monkeypatch):
+    from gateway.session_ingress import dispatch_shared_busy
+    from plugins.platforms.discord.reaction_controls import EMOJI_RETRY, handle_raw_reaction_add
+
+    runner, authority, adapter, _channel, source, key, cards, sends, tokens = await card_owner(tmp_path, monkeypatch)
+    adapter.config.extra["reaction_controls"] = True
+    adapter._allowed_user_ids = {"42"}
+    entered, released = asyncio.Event(), asyncio.Event()
+    infer = runner._run_agent
+    attachment_metadata = []
+    deliver_attachments = adapter._deliver_attachments
+    send = adapter.send
+
+    async def numbered_send(*args, **kwargs):
+        result = await send(*args, **kwargs)
+        result.message_id = f"reply-{len(sends)}"
+        return result
+
+    async def attachments(event, extracted, metadata, **kwargs):
+        attachment_metadata.append(dict(metadata))
+        return await deliver_attachments(event, extracted, metadata, **kwargs)
+
+    async def gated(**kwargs):
+        if kwargs["message"] == "first":
+            entered.set()
+            await released.wait()
+        return await infer(**kwargs)
+
+    monkeypatch.setattr(adapter, "send", numbered_send)
+    monkeypatch.setattr(adapter, "_deliver_attachments", attachments)
+    monkeypatch.setattr(runner, "_run_agent", gated)
+    assert adapter._start_session_processing(MessageEvent(text="first", source=source, message_id="input-1"), key)
+    first = adapter._session_tasks[key]
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        follower = MessageEvent(text="second", source=source, message_id="input-2")
+        follower._fifo_only = True
+        follower._stop_epoch = runner._route_stop_epoch(key)
+        await dispatch_shared_busy(adapter, follower, key)
+        released.set()
+        await asyncio.wait_for(first, 15)
+        await drain_owner(authority)
+        await async_wait_until(lambda: not adapter._background_tasks, timeout=10)
+        assert adapter._last_final_messages[key] == "reply-2"
+        assert attachment_metadata[-1]["hermes_run"] == tokens[1]
+        retry = AsyncMock(return_value=True)
+        monkeypatch.setattr(runner, "_gateway_retry_if_last", retry)
+        await handle_raw_reaction_add(adapter, SimpleNamespace(
+            user_id=42, message_id="reply-2", emoji=EMOJI_RETRY, member=None, guild_id=None,
+        ))
+        retry.assert_awaited_once_with(key, "reply-2")
+    finally:
+        released.set()
+        if not first.done():
+            first.cancel()
+        with suppress(asyncio.CancelledError):
+            await first
         for card in cards:
             await adapter._stop_status_card_refresh(card)
         await adapter._cancel_card_hook_tasks()

@@ -341,7 +341,10 @@ class DiscordStatusCardsMixin:
                     card.terminal_completed = True
                 return completed
             finally:
-                await self._compare_pop_status_card(card)
+                if outcome == "interrupted" and not card.terminal_completed:
+                    card.terminal_attempted = False
+                else:
+                    await self._compare_pop_status_card(card)
                 card.terminalizing = False
 
     def _read_status_card_entries(self) -> list[dict[str, Any]]:

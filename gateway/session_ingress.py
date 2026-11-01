@@ -467,7 +467,11 @@ async def _deliver_response(adapter, event, session_key, response, results):
     if not text:
         return True
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
-    metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
+    metadata = _thread_metadata_for_event(event)
+    if isinstance(getattr(event, "_hermes_run", None), dict):
+        metadata = dict(metadata or {})
+        metadata["hermes_run"] = dict(event._hermes_run)
+    metadata = _mark_notify_metadata(metadata)
     if extracted.text_content:
         await adapter._send_final_text(event, session_key, extracted.text_content,
                                        metadata, ttl > 0, ttl, results.append)
