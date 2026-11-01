@@ -24,6 +24,7 @@ from gateway.platforms.base_image_sniff import _looks_like_image
 from gateway.platforms.base_media_flags import pad_inline_flags
 from gateway.runtime_footer import footer_onto_photo_caption, send_footer_unless_captioned
 from gateway.platforms.session_model import _SessionModelSettingsMixin
+from gateway.platforms.base_run_controls import PlatformRunControlsMixin
 from utils import normalize_proxy_url, unlink_files_older_than
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
@@ -1801,7 +1802,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+class BasePlatformAdapter(PlatformRunControlsMixin, _SessionModelSettingsMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -1898,6 +1899,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
+        self._card_hook_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
         self._owner_profile: Optional[str] = None
@@ -4204,13 +4206,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             response, event, session_key, is_ephemeral_response=False)).text_content
         return bool(text) and await ledger_attempted(self, event, session_key, text, error)
 
-    async def _release_turn_marker(self, event: MessageEvent) -> None:
-        """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or
-        nothing more is owed (no kill leaves a persisted reply with neither), then wake the drain. Idempotent."""
-        if (getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None)
-                and self.gateway_runner is not None):
-            await self.gateway_runner._clear_durable_active_turn(event)
-        getattr(event, "_gateway_marker_released", asyncio.Event()).set()
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
@@ -4220,6 +4215,16 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
+        if (
+            result.success
+            and result.message_id
+            and self.gateway_runner is not None
+            and self._gateway_run_controls_enabled(delivery_adapter)
+        ):
+            await self.gateway_runner._record_final_message(
+                delivery_adapter, event.source.chat_id, str(result.message_id),
+                session_key=session_key, metadata=metadata,
+            )
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
@@ -4373,13 +4378,21 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         interrupt_event = guard_under_commands(self._active_sessions.get(session_key)) or asyncio.Event()
         self._active_sessions.setdefault(session_key, interrupt_event)  # an in-flight command keeps its own
         _thread_metadata = _thread_metadata_for_event(event)
+        if isinstance(getattr(event, "_hermes_run", None), dict):
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["hermes_run"] = dict(event._hermes_run)
         _typing_metadata = typing_metadata_for_turn(  # fixed now: a later inbound must not move it
             self, event.source.chat_id, _reply_anchor_for_event(event), _thread_metadata)
         typing_task = self._start_typing_refresh(event, interrupt_event, _typing_metadata)
+        response = None
+        propagating_cancellation, hook_cancellation = False, None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            if isinstance(getattr(event, "_hermes_run", None), dict):
+                _thread_metadata = dict(_thread_metadata or {})
+                _thread_metadata["hermes_run"] = dict(event._hermes_run)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4461,12 +4474,16 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            event._hermes_turn_outcome = "interrupted"
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
+            propagating_cancellation = True
             raise
         except BaseException as e:
+            if isinstance(getattr(event, "_hermes_run", None), dict):
+                event._hermes_turn_outcome = "failed"
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             await self._notify_turn_error(event, e)
@@ -4474,6 +4491,14 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)) and not isinstance(e, _outage):  # rest contained
                 raise
         finally:
+            card_hook_task = self._start_card_hook_task(
+                event, session_key, interrupt_event, _thread_metadata,
+                delivery_attempted, delivery_succeeded,
+            )
+            try:
+                await asyncio.shield(card_hook_task)
+            except asyncio.CancelledError as exc:
+                hook_cancellation = None if propagating_cancellation else exc
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it alive.
@@ -4484,6 +4509,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if hook_cancellation is not None:
+                raise hook_cancellation
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot

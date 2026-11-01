@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+from typing import Any, Optional
+
+from gateway.platforms.event import MessageEvent
+
+logger = logging.getLogger("gateway.platforms.base")
+
+
+class PlatformRunControlsMixin:
+    async def _finish_card_with_deadline(self, *args: Any) -> None:
+        try:
+            await asyncio.wait_for(self._run_gateway_turn_end_hooks(*args), timeout=5.0)
+        except Exception:
+            logger.warning("[%s] Turn-end card hook failed or timed out", self.name, exc_info=True)
+
+    def _start_card_hook_task(self, *args: Any) -> asyncio.Task:
+        task = asyncio.create_task(self._finish_card_with_deadline(*args))
+        self._card_hook_task_set().add(task)
+        task.add_done_callback(self._card_hook_done)
+        return task
+
+    def _card_hook_task_set(self) -> set[asyncio.Task]:
+        tasks = getattr(self, "_card_hook_tasks", None)
+        if tasks is None:
+            self._card_hook_tasks = tasks = set()
+        return tasks
+
+    def _card_hook_done(self, task: asyncio.Task) -> None:
+        self._card_hook_task_set().discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _cancel_card_hook_tasks(self) -> None:
+        tasks = list(self._card_hook_task_set())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_gateway_turn_end_hooks(
+        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
+        metadata: Optional[dict[str, Any]], delivery_attempted: bool, delivery_succeeded: bool,
+    ) -> None:
+        from gateway.platforms.base import _reply_anchor_for_event
+        hermes_run = getattr(event, "_hermes_run", None)
+        if not isinstance(hermes_run, dict) or not self._gateway_run_controls_enabled(self):
+            return
+        from gateway.session_run_lifecycle import claim_run
+        if not claim_run(event):
+            return
+        hook_metadata = dict(metadata or {})
+        hook_metadata["hermes_run"] = dict(hermes_run)
+        preliminary = getattr(event, "_hermes_turn_outcome", "failed")
+        outcome = (
+            "done"
+            if preliminary == "done" and delivery_attempted and delivery_succeeded
+            else "interrupted"
+            if interrupt_event.is_set() or preliminary == "interrupted"
+            else "failed"
+            if preliminary == "failed" or (delivery_attempted and not delivery_succeeded)
+            else "done"
+        )
+        finalize = getattr(self, "finalize_native_task_card", None)
+        if callable(finalize):
+            try:
+                result = finalize(
+                    event.source.chat_id, outcome=outcome,
+                    reply_to=_reply_anchor_for_event(event), metadata=hook_metadata,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("[%s] Native task-card finalization failed", self.name, exc_info=True)
+        turn_end = getattr(self, "on_turn_end", None)
+        if callable(turn_end):
+            try:
+                result = turn_end(event.source.chat_id, metadata=hook_metadata, outcome=outcome)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("[%s] Turn-end hook failed", self.name, exc_info=True)
+
+
+    @staticmethod
+    def _gateway_run_controls_enabled(adapter: Any) -> bool:
+        enabled = getattr(adapter, "gateway_run_controls_enabled", None)
+        if not callable(enabled):
+            return False
+        try:
+            return enabled() is True
+        except Exception:
+            logger.warning("Adapter run-control capability check failed", exc_info=True)
+            return False
+
+
+    async def _release_turn_marker(self, event: MessageEvent) -> None:
+        if (getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None)
+                and self.gateway_runner is not None):
+            await self.gateway_runner._clear_durable_active_turn(event)
+        getattr(event, "_gateway_marker_released", asyncio.Event()).set()

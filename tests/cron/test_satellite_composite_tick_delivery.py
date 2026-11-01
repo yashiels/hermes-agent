@@ -10,6 +10,8 @@ from unittest.mock import patch
 from gateway.config import Platform
 
 from tests.cron.satellite_composite_harness import (
+    DISCORD_ROUTED,
+    WA_ROUTED,
     assert_own_discord,
     assert_routed_whatsapp,
     assert_unrouted_whatsapp,
@@ -79,3 +81,30 @@ def test_tick_satellite_borrows_only_routed_unowned_platforms(tmp_path, monkeypa
         tmp_path, monkeypatch, {"jarvis": {}}, primary, "empty",
     )
     assert_zero_own(empty_view, primary_wa, primary_discord)
+
+
+def test_disconnected_owned_bot_never_borrows_primary_adapter():
+    from cron.scheduler_preflight import satellite_delivery_adapters
+
+    primary_discord = recording_adapter()
+    primary_wa = recording_adapter()
+    view = satellite_delivery_adapters(
+        {}, {Platform.DISCORD: primary_discord, Platform.WHATSAPP: primary_wa},
+        satellite_routes(), owned_platforms={Platform.DISCORD},
+    )
+    assert view.owns(Platform.DISCORD)
+    assert view.get(Platform.DISCORD, {"chat_id": DISCORD_ROUTED}) is None
+    assert view.get(Platform.WHATSAPP, {"chat_id": "unrouted"}) is None
+    assert view.get(Platform.WHATSAPP, {"chat_id": WA_ROUTED}) is primary_wa
+
+
+def test_local_adapter_keeps_exact_routed_satellite_delivery():
+    from cron.scheduler_preflight import satellite_delivery_adapters
+
+    primary_wa = recording_adapter()
+    view = satellite_delivery_adapters(
+        {Platform.LOCAL: recording_adapter()}, {Platform.WHATSAPP: primary_wa},
+        satellite_routes(),
+    )
+    assert view.get(Platform.WHATSAPP, {"chat_id": WA_ROUTED}) is primary_wa
+    assert view.get(Platform.LOCAL) is not None

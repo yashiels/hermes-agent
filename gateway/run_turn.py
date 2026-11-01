@@ -5,6 +5,8 @@ are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.
 
 from __future__ import annotations
 
+from gateway.run_turn_controls import GatewayTurnControlsMixin
+
 from pm import install_hint
 import logging
 from typing import TYPE_CHECKING
@@ -169,7 +171,7 @@ from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 
 
-class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
+class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnControlsMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
 
@@ -217,6 +219,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
             _turn_channel_prompt, _turn_source = channel
+            hermes_run = self._new_adapter_run_token(_turn_source, session_key, run_generation)
+            if hermes_run is not None:
+                event._hermes_run = hermes_run
+                event._hermes_turn_outcome = "failed"
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -233,7 +239,17 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                hermes_run=hermes_run,
             )
+            if hermes_run is not None:
+                event._hermes_turn_outcome = (
+                    "interrupted"
+                    if not self._is_session_run_current(_quick_key, run_generation)
+                    or bool(isinstance(agent_result, dict) and agent_result.get("interrupted"))
+                    else "failed"
+                    if bool(isinstance(agent_result, dict) and agent_result.get("failed"))
+                    else "done"
+                )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -910,16 +926,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # cards stay on for unconfigured installs, but an operator who WRITES ``tool_progress: off``
         # (global, platform override, or legacy overrides) has asked for no tool progress at all and
         # gets no cards either. Every other explicit mode keeps the card lane.
-        _native_slack_task_cards = False
-        if (
-            source.platform == Platform.SLACK
-            and hasattr(adapter, "native_task_cards_enabled")
-            and not (_tool_progress_explicit and progress_mode == "off") and not bot_peer
-        ):
-            try:
-                _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
-            except Exception:
-                logger.debug("Slack native task-card config check failed", exc_info=True)
+        _native_slack_task_cards = not bot_peer and self._native_task_cards_enabled_for_turn(
+            adapter, _tool_progress_explicit, progress_mode,
+        )
         return self._RunAgentDisplay(
             user_config=user_config, platform_key=platform_key, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
@@ -1049,7 +1058,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             ),
             platform=source.platform,
         )
-        if _native_slack_task_cards:
+        if _native_slack_task_cards and source.platform == Platform.DISCORD and source.user_id:
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata.setdefault("owner_user_id", source.user_id)
+        if _native_slack_task_cards and source.platform == Platform.SLACK:
             # chat.startStream in channels requires the recipient team/user pair; harmless elsewhere.
             _progress_metadata = dict(_progress_metadata or {})
             if source.scope_id:
@@ -1783,6 +1795,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                     channel_prompt=next_channel_prompt, message_type=next_message_type,
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
+                    hermes_run=(turn_ctx._status_thread_metadata or {}).get("hermes_run"),
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
@@ -1955,10 +1968,25 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 "possible duplicate send (see wecom ack-timeout RCA).",
                 _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
             )
+        if (
+            response.get("already_sent")
+            and _sc is not None
+            and getattr(_sc, "message_id", None)
+            and getattr(_sc, "message_id", None) != "__no_edit__"
+            and getattr(_sc, "adapter", None) is not None
+            and session_key
+            and isinstance((turn_ctx._status_thread_metadata or {}).get("hermes_run"), dict)
+        ):
+            await self._record_final_message(
+                _sc.adapter, source.chat_id, str(_sc.message_id), session_key=session_key,
+                metadata=turn_ctx._status_thread_metadata,
+            )
+
 
     def _run_agent_bind_turn_wiring(
         self, turn_ctx: TurnContext, turn_runner: TurnRunner, source: SessionSource,
         event_message_id: Optional[str], _native_slack_task_cards: bool,
+        hermes_run: Optional[dict[str, Any]],
     ) -> Optional[dict[str, Any]]:
         """Resolve progress threading, then publish progress metadata and the sync→async bridges onto
         ``turn_ctx`` (the one-slot holders shared with run_sync's executor thread are TurnContext
@@ -1966,6 +1994,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         turn_ctx._progress_metadata, turn_ctx._progress_reply_to, _status_thread_metadata = (
             self._run_agent_progress_threading(source, event_message_id, _native_slack_task_cards)
         )
+        if hermes_run is not None:
+            turn_ctx._progress_metadata = dict(turn_ctx._progress_metadata or {})
+            turn_ctx._progress_metadata["hermes_run"] = dict(hermes_run)
+            _status_thread_metadata = dict(_status_thread_metadata or {})
+            _status_thread_metadata["hermes_run"] = dict(hermes_run)
         # Bridges: sync step/event/status callbacks → async hooks.emit and adapter.send.
         turn_ctx._loop_for_step = asyncio.get_running_loop()
         turn_ctx._hooks_ref = self.hooks
@@ -2021,6 +2054,21 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
+            activity_hook = getattr(_notify_adapter, "update_native_task_card_activity", None)
+            if turn_ctx._native_slack_task_cards and callable(activity_hook):
+                try:
+                    accepted = await activity_hook(
+                        source.chat_id,
+                        elapsed_s=max(0.0, time.time() - _notify_start),
+                        iteration=int((_a or {}).get("api_call_count", 0) or 0),
+                        max_iterations=int((_a or {}).get("max_iterations", 0) or 0),
+                        reply_to=turn_ctx._progress_reply_to,
+                        metadata=turn_ctx._progress_metadata,
+                    )
+                    if accepted is True:
+                        continue
+                except Exception:
+                    logger.warning("Native task-card activity update failed", exc_info=True)
             _heartbeat_text = (
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
@@ -2064,6 +2112,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        hermes_run: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2109,7 +2158,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
-            turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
+            turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards, hermes_run,
         )
         # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
