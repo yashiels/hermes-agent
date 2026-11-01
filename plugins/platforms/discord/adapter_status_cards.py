@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.platforms.base import SendResult
 
 if TYPE_CHECKING:
     from plugins.platforms.discord.status_card import CardState, StatusCardFrame
+
+
+logger = logging.getLogger("plugins.platforms.discord.adapter")
 
 
 class DiscordStatusCardsMixin:
@@ -67,7 +71,7 @@ class DiscordStatusCardsMixin:
         }
 
     async def _edit_status_card_frame(self, card: CardState, frame: StatusCardFrame) -> SendResult:
-        from plugins.platforms.discord.adapter import SendResult, StatusCardView, logger
+        from plugins.platforms.discord.adapter import SendResult, StatusCardView
         from plugins.platforms.discord.status_card import retry_message_edit
         try:
             view = StatusCardView(
@@ -78,7 +82,7 @@ class DiscordStatusCardsMixin:
             await retry_message_edit(self._resolve_channel, card, view=view)
             return SendResult(success=True, message_id=str(card.message.id))
         except Exception as exc:
-            logger.debug("[Discord] Status-card transport failed", exc_info=True)
+            logger.error("[Discord] Status-card transport failed", exc_info=True)
             return self._status_card_error_result(exc)
 
     async def _compare_pop_status_card(self, card: CardState) -> bool:
@@ -168,7 +172,7 @@ class DiscordStatusCardsMixin:
             self._status_card_history_loaded = True
 
     async def _record_status_card_history(self, card: CardState, finished_at: float) -> Optional[str]:
-        from plugins.platforms.discord.adapter import asyncio, atomic_json_write, logger, prune_status_card_history, secrets, status_card_history_rows
+        from plugins.platforms.discord.adapter import asyncio, atomic_json_write, prune_status_card_history, secrets, status_card_history_rows
         if len(card.tasks) <= 8:
             return None
         await self._load_status_card_history()
@@ -211,7 +215,7 @@ class DiscordStatusCardsMixin:
                     self._status_card_history.pop(nonce, None)
                 else:
                     self._status_card_history[nonce] = previous
-                logger.warning("[Discord] Failed to persist status-card history", exc_info=True)
+                logger.error("[Discord] Failed to persist status-card history", exc_info=True)
                 return None
         return nonce
 
@@ -227,7 +231,7 @@ class DiscordStatusCardsMixin:
     async def _disable_status_card_after_permanent_failure(
         self, card: CardState, *, send_fallback: bool, result: Optional[SendResult] = None,
     ) -> None:
-        from plugins.platforms.discord.adapter import logger
+
         async with card.lock:
             if card.terminal_completed or card.terminal_attempted or card.terminalizing:
                 return
@@ -257,7 +261,7 @@ class DiscordStatusCardsMixin:
                 try:
                     await self.send(card.chat_id, text, metadata=dict(card.delivery_metadata))
                 except Exception:
-                    logger.warning("[Discord] Status-card text fallback failed", exc_info=True)
+                    logger.error("[Discord] Status-card text fallback failed", exc_info=True)
                 card.terminal_completed = True
             finally:
                 card.terminalizing = False
@@ -274,7 +278,7 @@ class DiscordStatusCardsMixin:
     async def _terminalize_card_once(
         self, card: CardState, *, outcome: str, metadata: Optional[dict[str, Any]],
     ) -> bool:
-        from plugins.platforms.discord.adapter import asyncio, logger, time
+        from plugins.platforms.discord.adapter import asyncio, time
         async with card.lock:
             if card.terminal_attempted or card.terminal_completed:
                 return card.terminal_completed
@@ -315,7 +319,7 @@ class DiscordStatusCardsMixin:
                         await retry_message_edit(self._resolve_channel, card, view=None)
                         controls_removed = True
                     except Exception as exc:
-                        logger.warning(
+                        logger.error(
                             "[Discord] Status-card control removal failed for %s: %s",
                             card.nonce, exc, exc_info=True,
                         )
@@ -330,7 +334,7 @@ class DiscordStatusCardsMixin:
                         )
                         notice_succeeded = bool(notice.success)
                     except Exception:
-                        logger.warning("[Discord] Status-card terminal notice failed", exc_info=True)
+                        logger.error("[Discord] Status-card terminal notice failed", exc_info=True)
                 completed = terminal_succeeded or controls_removed or notice_succeeded
                 if completed:
                     await self._remove_status_card_persistence(card)
@@ -349,7 +353,7 @@ class DiscordStatusCardsMixin:
         return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
 
     def _status_card_run_is_current(self, session_key: str, generation: int) -> bool:
-        from plugins.platforms.discord.adapter import logger
+
         run_key = (str(session_key), int(generation))
         if run_key in self._ended_status_runs:
             return False
@@ -359,11 +363,11 @@ class DiscordStatusCardsMixin:
         try:
             return bool(checker(*run_key))
         except Exception:
-            logger.warning("[Discord] Status-card current-run check failed", exc_info=True)
+            logger.error("[Discord] Status-card current-run check failed", exc_info=True)
             return True
 
     async def _reconcile_persisted_status_card(self, entry: dict[str, Any]) -> None:
-        from plugins.platforms.discord.adapter import StatusCardView, logger, time
+        from plugins.platforms.discord.adapter import StatusCardView, time
         nonce = str(entry.get("nonce") or "")
         channel_id = str(entry.get("channel_id") or "")
         message_id = str(entry.get("message_id") or "")
@@ -389,7 +393,7 @@ class DiscordStatusCardsMixin:
                 attempts = 1
             if attempts >= 3:
                 self._status_card_persisted.pop(nonce, None)
-                logger.warning(
+                logger.error(
                     "[Discord] Dropping status card %s/%s after 3 reconciliation failures: %s",
                     channel_id, message_id, exc, exc_info=True,
                 )
@@ -397,7 +401,7 @@ class DiscordStatusCardsMixin:
                 retained = dict(entry)
                 retained["reconcile_attempts"] = attempts
                 self._status_card_persisted[nonce] = retained
-                logger.warning(
+                logger.error(
                     "[Discord] Status-card reconciliation attempt %d/3 failed for %s/%s: %s",
                     attempts, channel_id, message_id, exc, exc_info=True,
                 )
@@ -453,7 +457,7 @@ class DiscordStatusCardsMixin:
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
         fallback_text: Optional[str] = None,
     ) -> SendResult:
-        from plugins.platforms.discord.adapter import CardState, SendResult, StatusCardCoalescer, StatusCardView, logger, time
+        from plugins.platforms.discord.adapter import CardState, SendResult, StatusCardCoalescer, StatusCardView, time
         if not self.native_task_cards_enabled():
             return SendResult(success=False, error="Discord native task cards disabled")
         run = self._hermes_run(metadata)
@@ -485,7 +489,7 @@ class DiscordStatusCardsMixin:
                 from plugins.platforms.discord.status_card import retry_channel_send
                 message = await retry_channel_send(channel, view)
             except Exception as exc:
-                logger.debug("[Discord] Status-card transport failed", exc_info=True)
+                logger.error("[Discord] Status-card transport failed", exc_info=True)
                 return self._status_card_error_result(exc)
             card = CardState(
                 nonce=run["nonce"], generation=run["generation"],
@@ -571,7 +575,7 @@ class DiscordStatusCardsMixin:
 
     @staticmethod
     def _log_status_card_run_mismatch(card: CardState, run: dict[str, Any]) -> None:
-        from plugins.platforms.discord.adapter import logger
+
         if (card.session_key, card.generation) != (run["session_key"], run["generation"]):
             logger.info(
                 "[Discord] Status-card run mismatch nonce=%s card=(%s, %s) run=(%s, %s)",
@@ -679,7 +683,7 @@ class DiscordStatusCardsMixin:
             self._last_final_messages.popitem(last=False)
 
     async def handle_status_card_stop(self, interaction: Any, nonce: str) -> None:
-        from plugins.platforms.discord.adapter import _component_check_auth, _unauthorized, logger
+        from plugins.platforms.discord.adapter import _component_check_auth, _unauthorized
         key = self._status_card_keys_by_nonce.get(nonce)
         card = self._status_cards.get(key) if key is not None else None
         if card is None or card.nonce != nonce:

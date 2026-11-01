@@ -7,6 +7,7 @@ import threading
 import time
 from contextlib import suppress
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -90,6 +91,15 @@ from gateway.turn_context import TurnContext
 from plugins.platforms.discord.adapter import DiscordAdapter
 
 
+
+ShowAllCardButton: Any = None
+StatusCardCoalescer: Any = None
+StatusCardFrame: Any = None
+StatusCardView: Any = None
+StopCardButton: Any = None
+build_status_card_history_markdown: Any = None
+prune_status_card_history: Any = None
+status_card_history_rows: Any = None
 
 @pytest.fixture(autouse=True)
 def isolated_status_card_types(monkeypatch):
