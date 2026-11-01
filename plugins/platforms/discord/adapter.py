@@ -6497,7 +6497,6 @@ def _define_discord_view_classes() -> None:
             self._message = None
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
-            from plugins.platforms.discord.adapter_component_auth import _component_check_auth
             return _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids, live_auth=self.live_auth)
 

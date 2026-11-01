@@ -46,7 +46,7 @@ class GatewayTurnControlsMixin:
                 session_key, _cleanup_temp_bubbles, generation=turn_ctx.run_generation,
             )
         except Exception as _rpe:
-            logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
+            logger.error("Post-delivery cleanup registration failed: %s", _rpe, exc_info=True)
 
 
     @staticmethod
