@@ -14,18 +14,20 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import struct
 import subprocess
 import tempfile
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext, suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -34,6 +36,7 @@ from agent.async_utils import (consume_detached_task_result as _consume_backgrou
 from agent.display import ToolPreview
 from agent.i18n import get_language, t
 from agent.retry_utils import parse_retry_after_seconds
+from plugins.platforms.discord.adapter_component_auth import _component_check_auth
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +308,17 @@ try:
 except ImportError:
     from render import format_discord_message
 
+try:
+    from .reaction_controls import (
+        ReactionControlRegistry, add_approval_hint_reactions, finalize_approval_view,
+        handle_raw_reaction_add, resolve_approval_prompt,
+    )
+except ImportError:
+    from reaction_controls import (
+        ReactionControlRegistry, add_approval_hint_reactions, finalize_approval_view,
+        handle_raw_reaction_add, resolve_approval_prompt,
+    )
+
 from gateway.config import Platform, PlatformConfig, discord_channel_id_from_link
 
 from gateway.platforms.helpers import (
@@ -325,6 +339,46 @@ from gateway.platforms._shared import (
     extra_or_secret as _extra_or_secret, platform_gate_env as _scoped_gate_env, send_error,
     yaml_env_setter as _yaml_env_setter
 )
+
+CardState = StatusCardCoalescer = StatusCardFrame = StatusCardView = None
+StopCardButton = ShowAllCardButton = None
+build_status_card_history_markdown = prune_status_card_history = None
+status_card_history_filename = status_card_history_rows = None
+
+
+def _load_discord_status_card_types() -> None:
+    global CardState, StatusCardCoalescer, StatusCardFrame, StatusCardView
+    global StopCardButton, ShowAllCardButton, build_status_card_history_markdown
+    global prune_status_card_history, status_card_history_filename, status_card_history_rows
+    from plugins.platforms.discord.status_card import (
+        CardState as _CardState,
+        ShowAllCardButton as _ShowAllCardButton,
+        StatusCardCoalescer as _StatusCardCoalescer,
+        StatusCardFrame as _StatusCardFrame,
+        StatusCardView as _StatusCardView,
+        StopCardButton as _StopCardButton,
+        build_status_card_history_markdown as _build_status_card_history_markdown,
+        prune_status_card_history as _prune_status_card_history,
+        status_card_history_filename as _status_card_history_filename,
+        status_card_history_rows as _status_card_history_rows,
+    )
+    CardState = _CardState
+    StatusCardCoalescer = _StatusCardCoalescer
+    StatusCardFrame = _StatusCardFrame
+    StatusCardView = _StatusCardView
+    StopCardButton = _StopCardButton
+    ShowAllCardButton = _ShowAllCardButton
+    build_status_card_history_markdown = _build_status_card_history_markdown
+    prune_status_card_history = _prune_status_card_history
+    status_card_history_filename = _status_card_history_filename
+    status_card_history_rows = _status_card_history_rows
+
+
+if DISCORD_AVAILABLE and all(
+    hasattr(discord.ui, name)
+    for name in ("ActionRow", "Container", "DynamicItem", "LayoutView", "Separator", "TextDisplay")
+):
+    _load_discord_status_card_types()
 
 
 def _unauthorized() -> str:
@@ -657,6 +711,11 @@ def check_discord_requirements() -> bool:
     Intents = _Intents
     commands = _commands
     DISCORD_AVAILABLE = True
+    if all(
+        hasattr(discord.ui, name)
+        for name in ("ActionRow", "Container", "DynamicItem", "LayoutView", "Separator", "TextDisplay")
+    ):
+        _load_discord_status_card_types()
     _define_discord_view_classes()
     return True
 
@@ -1225,7 +1284,10 @@ from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesM
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 
 
-class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin,
+from plugins.platforms.discord.adapter_status_cards import DiscordStatusCardsMixin
+
+
+class DiscordAdapter(DiscordStatusCardsMixin, DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin,
                      DiscordSlashAuthMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
@@ -1234,6 +1296,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     allow_from_covers_groups = True  # no group_allow_from: allow_from is the one user allowlist
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    native_task_card_full_history = True
+    native_task_card_retryable_failures_preserve_lane = True
     # Safety ceiling on split deliveries: chunks beyond the cap become a notice (degenerate turns).
     # Safety ceiling on split deliveries (#86581): a degenerate turn can produce tens of thousands of
     # characters — without a cap the adapter posts every 2000-char chunk back-to-back and floods the channel
@@ -1351,6 +1415,24 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         # Telegram #58563 fix.
         self._last_overflow_preview: dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        self._gateway_controls = None
+        self._gateway_controls_warning_emitted = False
+        self._status_cards: dict[tuple[str, str], CardState] = {}
+        self._status_card_keys_by_nonce: dict[str, tuple[str, str]] = {}
+        self._status_card_persisted: dict[str, dict[str, Any]] = {}
+        self._status_message_ids: dict[tuple[str, str, int, str], str] = {}
+        self._ended_status_runs: OrderedDict[tuple[str, int], None] = OrderedDict()
+        self._ended_status_nonces: OrderedDict[str, str] = OrderedDict()
+        self._last_final_messages: OrderedDict[str, str] = OrderedDict()
+        self._reaction_registry = ReactionControlRegistry()
+        self._status_card_persistence_lock = asyncio.Lock()
+        self._status_card_history_lock = asyncio.Lock()
+        self._status_card_history: dict[str, dict[str, Any]] = {}
+        self._status_card_history_loaded = False
+        self._status_card_refresh_interval = 15.0
+        from hermes_constants import get_hermes_home
+        self._status_card_persistence_path = get_hermes_home() / "state" / "discord_status_cards.json"
+        self._status_card_history_path = get_hermes_home() / "state" / "discord_status_card_history.json"
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -1503,6 +1585,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 allowed_mentions=_build_allowed_mentions(getattr(self.config, "extra", None)),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._client._hermes_discord_adapter = self
+            if StopCardButton is not None and callable(getattr(self._client, "add_dynamic_items", None)):
+                self._client.add_dynamic_items(StopCardButton, ShowAllCardButton)
             # Fresh connection, fresh dispatch-side silence window: the previous client's last
             # DISPATCH stamp must not leak into this connection's liveness samples (#109521).
             # READY itself is a DISPATCH event, so a healthy connection stamps almost immediately.
@@ -1547,6 +1632,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             @self._client.event
             async def on_message_delete(message: DiscordMessage):
                 await adapter_self._on_platform_message_delete(message)
+
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                await handle_raw_reaction_add(adapter_self, payload)
 
             @self._client.event
             async def on_thread_create(thread):
@@ -2160,6 +2249,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        await self._cancel_card_hook_tasks()
         # Cancel the liveness probe first so it can't fire a spurious fatal/reconnect mid-teardown.
         await self._cancel_liveness_task()
         # Leave voice *before* cancelling the bot task: VoiceClient.disconnect() needs the main
@@ -2361,6 +2451,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if not self._client:
             return
         try:
+            if self.native_task_cards_enabled():
+                await self._reconcile_status_cards()
+                await self._load_status_card_history()
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
@@ -3308,6 +3401,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+            if message_ids and self.reaction_controls_enabled():
+                run = self._hermes_run(metadata)
+                if run is not None:
+                    for sent_id in message_ids:
+                        self._reaction_registry.register_run_message(
+                            sent_id, session_key=run["session_key"],
+                            generation=run["generation"], nonce=run["nonce"],
+                        )
             # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
             # marker so the reconnect sweep can replay this final response instead of stranding it until a
             # process restart (#95382 silent partial loss).
@@ -4569,10 +4670,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
             )
+        context_menu_count = 0
+        if self._context_menus_enabled():
+            from plugins.platforms.discord.context_menus import message_context_menu_count
+            context_menu_count = message_context_menu_count()
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.
         already_registered: set[str] = set()
-        slot_cap = _DISCORD_MAX_APP_COMMANDS - 1
+        slot_cap = _DISCORD_MAX_APP_COMMANDS - 1 - context_menu_count
         dropped_over_cap = 0
 
         def _auto_register(name: str, description: str, args_hint: str) -> None:
@@ -4622,6 +4727,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         except Exception as e:
             logger.warning("Discord auto-register from plugin commands failed: %s", e)
         self._register_skill_group(tree)
+        if context_menu_count:
+            self._register_discord_context_menus(tree)
         if dropped_over_cap:
             # One over-limit command makes Discord reject the entire sync (error 30032).
             logger.warning(
@@ -4638,6 +4745,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             "true", "1", "yes", "on",
         }:
             self._apply_owner_only_visibility(tree)
+
+    def _register_discord_context_menus(self, tree) -> None:
+        from plugins.platforms.discord.context_menus import register_context_menus
+        try:
+            registered = register_context_menus(self, tree)
+        except Exception as e:
+            logger.warning("[%s] Failed to register Discord context menus: %s", self.name, e, exc_info=True)
+            return
+        logger.info("[%s] Registered %d Discord message context menu(s)", self.name, registered)
 
     def _apply_owner_only_visibility(self, tree) -> None:
         """Set default_member_permissions=0 on every registered slash command.
@@ -5687,6 +5803,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Send an approval with content as its canonical payload and an embed for state."""
+        await self._set_status_card_approval(prompt.metadata, True)
+
+        async def _restore_running() -> None:
+            await self._set_status_card_approval(prompt.metadata, False)
+
         require_admin, admin_user_ids = _resolve_exec_approval_admin_gate(getattr(self.config, "extra", None))
         choices = set(prompt.choices)
         view = ExecApprovalView(
@@ -5694,7 +5815,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             allowed_role_ids=self._allowed_role_ids, require_admin=require_admin,
             admin_user_ids=admin_user_ids, allow_permanent="always" in choices,
             allow_session="session" in choices, smart_denied=prompt.smart_denied,
-            request_id=prompt.request_id,
+            request_id=prompt.request_id, approval_state_callback=_restore_running,
+            lock_registry=getattr(self, "_reaction_registry", None),
         )
         # Observe BEFORE sending, so a request that settles while the card is in flight still
         # reports its real reason; ``pending_retire`` holds it until the card exists.
@@ -5719,6 +5841,18 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     )
             return send_kwargs, view
         result = await self._send_prompt(prompt.chat_id, prompt.metadata, _build)
+        if not result.success:
+            await _restore_running()
+        elif self.reaction_controls_enabled():
+            message = getattr(view, "_message", None)
+            if view is not None and message is not None:
+                self._reaction_registry.register_approval(
+                    result.message_id, session_key=prompt.session_key,
+                    require_admin=view.require_admin, admin_user_ids=view.admin_user_ids,
+                    expires_at=time.time() + _read_discord_prompt_timeout(),
+                    message=message, view=view,
+                )
+                await add_approval_hint_reactions(message)
         if result.success and view.pending_retire:
             await view.retire(view.pending_retire)
         return result

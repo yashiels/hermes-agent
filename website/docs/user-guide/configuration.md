@@ -3050,7 +3050,8 @@ approvals:
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](./security.md#user-defined-deny-rules-approvalsdeny) for details.
 
-### Plugin-rule exemptions
+Plugin-rule exemptions
+----------------------
 
 `approvals.plugin_rule_exemptions` defaults to an empty mapping. It can exempt
 terminal `plugin_rule:terminal` escalations from the registered `jev-judge` plugin:

@@ -23,14 +23,17 @@ def build_exec_approval_view(discord, base, *, unauthorized):
             self, session_key: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
             require_admin: bool = False, admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True, allow_session: bool = True, smart_denied: bool = False,
-            request_id: Optional[str] = None,
+            request_id: Optional[str] = None, approval_state_callback=None, lock_registry=None,
         ):
             super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
             self.request_id = request_id
+            self.approval_state_callback = approval_state_callback
+            self._lock_registry = lock_registry
             self.pending_retire: Optional[str] = None  # settle reason that arrived before the card was sent
             self._backend_settled = False
             self._retire_lock = asyncio.Lock()
+            self._click_lock = asyncio.Lock()
             self.require_admin = require_admin
             self.admin_user_ids = {str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()}
             self._localize_buttons(
@@ -66,8 +69,15 @@ def build_exec_approval_view(discord, base, *, unauthorized):
                 )
             return False
 
+        async def _restore_status_card(self):
+            if self.approval_state_callback is not None:
+                await self.approval_state_callback()
+
         async def on_timeout(self):
-            await self.retire("timeout", backend_settled=False)
+            try:
+                await self.retire("timeout", backend_settled=False)
+            finally:
+                await self._restore_status_card()
 
         async def retire(self, reason="resolved", *, backend_settled=True):
             """Disable a card when its particular backend request is no longer pending."""
@@ -87,8 +97,23 @@ def build_exec_approval_view(discord, base, *, unauthorized):
                 }.get(reason, "platform.discord.slash_confirm.resolved_cancel"))
                 # The timeout notice edits only the content, so it never restores the controls.
                 await self._expire_embed(footer, keep_controls=False)
+                await self._restore_status_card()
 
-        async def _resolve(self, interaction: discord.Interaction, choice: str, color: discord.Color, label_key: str):
+        async def _resolve(self, interaction: discord.Interaction, choice: str, color=None, label_key=None):
+            from plugins.platforms.discord.reaction_controls import _APPROVAL_STYLE
+            default_label, color_fn = _APPROVAL_STYLE.get(choice, _APPROVAL_STYLE["deny"])
+            color = color if color is not None else color_fn()
+            label_key = label_key or default_label
+            message = getattr(interaction, "message", None) or self._message
+            message_id = getattr(message, "id", None)
+            lock = (self._lock_registry.lock_for(message_id)
+                    if self._lock_registry is not None and message_id is not None else self._click_lock)
+            async with lock:
+                await self._resolve_locked(interaction, choice, color, label_key)
+                if self.resolved and self._lock_registry is not None and message_id is not None:
+                    self._lock_registry.discard(message_id)
+
+        async def _resolve_locked(self, interaction: discord.Interaction, choice: str, color: discord.Color, label_key: str):
             """Resolve the approval via the gateway approval queue and update the embed."""
             if not await self._gate(
                 interaction, resolved_msg=t("platform.discord.approval.already_resolved"),
@@ -102,7 +127,8 @@ def build_exec_approval_view(discord, base, *, unauthorized):
             # wait timed out (count == 0) must not claim "Approved".
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice, request_id=self.request_id)
+                kwargs = {"request_id": self.request_id} if self.request_id else {}
+                count = resolve_gateway_approval(self.session_key, choice, **kwargs)
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,
@@ -138,6 +164,8 @@ def build_exec_approval_view(discord, base, *, unauthorized):
                     self._backend_settled = False
                     await self.retire("resolved")
                 raise
+            finally:
+                await self._restore_status_card()
 
         # Decorator labels are placeholders; ``_localize_buttons`` in __init__ sets the real text.
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)

@@ -7,6 +7,8 @@ adapters for GatewayRunner (mixin bound via the MRO).
 
 from __future__ import annotations
 
+from gateway.run_adapter_controls import GatewayAdapterControlsMixin, _GatewayControls
+
 import logging
 from typing import TYPE_CHECKING
 import asyncio
@@ -67,7 +69,7 @@ class _UnresolvedProfileHome:
 UNRESOLVED_PROFILE_HOME = _UnresolvedProfileHome()
 
 
-class GatewayAdapterLifecycleMixin:
+class GatewayAdapterLifecycleMixin(GatewayAdapterControlsMixin):
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
 
     @staticmethod
@@ -1378,12 +1380,21 @@ class GatewayAdapterLifecycleMixin:
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
+        set_gateway_controls = getattr(adapter, "set_gateway_controls", None)
+        if callable(set_gateway_controls):
+            controls = getattr(self, "_gateway_controls", None)
+            if controls is None:
+                controls = self._gateway_controls = _GatewayControls(self)
+            set_gateway_controls(controls)
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
         timing = busy_text_timing or getattr(self, "_busy_text_timing", None)
         if timing:
             adapter._busy_text_debounce_seconds, adapter._busy_text_hard_cap_seconds = timing
         adapter._human_delay_range_ms = (
             getattr(self, "_human_delay", None) if human_delay is _UNSET else human_delay)
+
+
+
 
     def _configure_profile_adapter(
         self, adapter: BasePlatformAdapter, profile_name: str, platform: Platform

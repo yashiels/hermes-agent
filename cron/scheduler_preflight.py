@@ -218,14 +218,6 @@ def _borrows_unowned_platform(own, routes) -> bool:
 
 
 class SharedRouteAdapters:
-    """Per-platform adapter view for a satellite profile.
-
-    A platform the satellite owns resolves to its own adapter. A platform it does
-    not own resolves to the primary adapter only when ``ProfileRoute.matches``
-    accepts the target; anything else (unmatched target, disabled route, other
-    profile, or target-less ``get(platform)`` on an unowned platform) is a miss.
-    An empty own map is the credentialless view (#101113).
-    """
 
     def __init__(self, primary_adapters, routes, *, own_adapters=None, owned_platforms=None) -> None:
         self._primary = dict(primary_adapters or {})
@@ -304,7 +296,8 @@ def manual_cron_adapters(runner, profile, resolved):
         return resolved
     primary = getattr(runner, "adapters", None) or {}
     routes = _primary_profile_routes_for_current_home()
-    if not own:
+    owned = (getattr(runner, "_profile_bot_platforms", None) or {}).get(profile)
+    if not own and not owned:
         if not shared:
             return resolved
         return satellite_delivery_adapters({}, resolved or primary, routes)

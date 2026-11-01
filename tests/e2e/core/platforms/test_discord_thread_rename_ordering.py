@@ -34,6 +34,10 @@ async def test_batched_thread_updates_retire_the_alias_through_connected_bot(mon
         monkeypatch.setattr(discord_platform, "commands", commands)
         monkeypatch.setattr(discord_platform, "Intents", discord.Intents)
         monkeypatch.setattr(discord_platform, "DISCORD_AVAILABLE", True)
+        sys.modules.pop("plugins.platforms.discord.status_card", None)
+        status_cards = importlib.import_module("plugins.platforms.discord.status_card")
+        for name in ("StopCardButton", "ShowAllCardButton"):
+            monkeypatch.setattr(discord_platform, name, getattr(status_cards, name))
         monkeypatch.setattr(discord_platform, "_load_opus_codec", lambda: None)
         adapter = discord_platform.DiscordAdapter(PlatformConfig(
             enabled=True, token="fake", extra={"slash_commands": False}))

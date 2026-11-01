@@ -13,7 +13,7 @@ handling, and fail-closed behavior so the parity cannot regress.
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -35,8 +35,6 @@ from plugins.platforms.discord.adapter_component_auth import _component_check_au
 
 @pytest.fixture(autouse=True)
 def _clear_component_auth_env(monkeypatch):
-    from unittest.mock import MagicMock, patch
-
     for name in (
         "DISCORD_ALLOW_ALL_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
@@ -253,8 +251,6 @@ def test_view_empty_allowlists_allow_with_explicit_allow_all(monkeypatch):
 
 def test_component_check_pairing_approved_user_passes(monkeypatch):
     """User approved in pairing store passes even without allowlists."""
-    from unittest.mock import MagicMock, patch
-
     mock_store = MagicMock()
     mock_store.is_approved.return_value = True
     # Override the autouse fixture's mock with approved=True
@@ -325,4 +321,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-
