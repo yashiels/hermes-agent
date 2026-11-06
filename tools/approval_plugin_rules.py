@@ -33,6 +33,7 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
 
     from tools.approval_plugin_acpx import acpx_command_owner, acpx_exemption_policy
     from tools.approval_plugin_remote import remote_command_owner, remote_exemption_policy
+    from tools.approval_plugin_readonly import readonly_command_matches, readonly_command_policy
 
     policy = approval_context._get_approval_config().get("plugin_rule_exemptions", {})
     command = (tool_args or {}).get("command")
@@ -43,7 +44,8 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
         return blocked
     remote_policy = remote_exemption_policy(policy)
     acpx_policy = acpx_exemption_policy(policy)
-    if remote_policy is None or acpx_policy is None:
+    readonly_policy = readonly_command_policy(policy)
+    if remote_policy is None or acpx_policy is None or readonly_policy is None:
         return None
     lists = [policy.get(key, []) for key in ("rule_keys", "plugins", "gh_owners")]
     if any(not isinstance(items, list) or any(not isinstance(item, str) for item in items) for items in lists):
@@ -55,6 +57,9 @@ def plugin_rule_exemption(tool_name: str, tool_args: dict | None, rule_key: str,
     segments = command_segments(command)
     if not segments:
         return None
+    if readonly_command_matches(command, segments, readonly_policy):
+        logger.info("Plugin-rule exemption: readonly_commands")
+        return {"approved": True, "message": None}
     if any(argv[0] == "ssh" for argv in segments) and command_segments(command, forbid_pipes=True) is None:
         return None
     if any(argv[0] == "acpx" for argv in segments) and command_segments(command, forbid_sequencing=True) is None:
