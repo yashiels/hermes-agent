@@ -299,7 +299,7 @@ async def test_cancelled_waiter_is_finished_by_its_admission_owner(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_cancelled_queued_owner_releases_unexecuted_card_context(tmp_path, monkeypatch):
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from gateway.session_ingress import dispatch_shared_busy
     from hermes_state_runtime import list_session_admissions
 
@@ -328,7 +328,7 @@ async def test_cancelled_queued_owner_releases_unexecuted_card_context(tmp_path,
         sid = next(iter(authority.sessions))
         rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
         queued = next(row for row in rows if row["payload"]["text"] == "second")
-        actor = Principal("human", authority.profile_id, frozenset({"session:submit", "session:control"}), "fixture")
+        actor = SessionActor("human", authority.profile_id, frozenset({"session:submit", "session:control"}), "fixture")
         await authority.cancel_queued(actor, SessionRef(authority.profile_id, sid), queued["admission_id"])
         await async_wait_until(lambda: queued["admission_id"] not in getattr(authority, "card_runs", {}), timeout=2)
         released.set()

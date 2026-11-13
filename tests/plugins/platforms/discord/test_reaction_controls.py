@@ -45,6 +45,8 @@ class FakeMessage:
 class FakeView:
     def __init__(self, approval_state_callback=None):
         self.resolved = False
+        self.request_id = "request-1"
+        self.approval_extra = {}
         self.children = [SimpleNamespace(disabled=False)]
         self.approval_state_callback = approval_state_callback
 
@@ -125,7 +127,7 @@ async def test_resolve_approval_prompt_finalizes_and_calls_state_callback():
         finalized["footer"] = footer
 
     with patch("tools.approval.resolve_gateway_approval", return_value=1):
-        count = await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize)
+        count = await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize, actor_id="42")
     assert count == 1
     assert "alice" in finalized["footer"]
     assert callback_calls == {"n": 1}
@@ -142,7 +144,7 @@ async def test_resolve_approval_prompt_already_resolved_skips_finalize_and_callb
     finalize = AsyncMock()
 
     with patch("tools.approval.resolve_gateway_approval", return_value=0):
-        count = await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize)
+        count = await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize, actor_id="42")
     assert count == 0
     finalize.assert_not_awaited()
     assert callback_calls == {"n": 0}
@@ -162,7 +164,7 @@ async def test_resolve_approval_prompt_calls_callback_even_when_finalize_raises(
 
     with patch("tools.approval.resolve_gateway_approval", return_value=1):
         with pytest.raises(RuntimeError):
-            await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize)
+            await resolve_approval_prompt("session-1", "once", "alice", view=view, finalize=finalize, actor_id="42")
     assert callback_calls == {"n": 1}
 
 
@@ -354,3 +356,34 @@ async def test_add_approval_hint_reactions_adds_both_emoji():
     assert message.add_reaction.await_args_list == [
         ((EMOJI_APPROVE,),), ((EMOJI_DENY,),),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('refusal', ['unbound', 'deny_only', 'other_requester'])
+async def test_reaction_keeps_unbound_or_refused_approval_pending(refusal):
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    adapter = FakeAdapter()
+    adapter.config = SimpleNamespace(extra={})
+    entry = _ApprovalEntry({'request_id': 'request-1', 'command': 'guarded'})
+    entry.authority = {'requester_id': '7' if refusal == 'other_requester' else '42', 'approvers': []}
+    entry.card_deny_only = refusal == 'deny_only'
+    view = FakeView()
+    view.request_id = None if refusal == 'unbound' else 'request-1'
+    message = FakeMessage()
+    adapter._reaction_registry.register_approval(
+        'm1', session_key='request-bound', require_admin=False, admin_user_ids=set(),
+        expires_at=time.time() + 60, message=message, view=view,
+    )
+    with approval._lock:
+        approval._gateway_queues['request-bound'] = [entry]
+    try:
+        await handle_raw_reaction_add(adapter, _payload())
+        assert entry.result is None
+        assert not view.resolved
+        assert adapter._reaction_registry.get('m1') is not None
+        message.edit.assert_not_awaited()
+    finally:
+        with approval._lock:
+            approval._gateway_queues.pop('request-bound', None)

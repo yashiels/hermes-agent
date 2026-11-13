@@ -73,7 +73,7 @@ def test_turn_approval_card_goes_through_the_replacement_adapter(tmp_path, monke
     turn._runner, turn._ctx = runner, ctx
 
     async def wire_then_rebuild():
-        runner._run_agent_bind_turn_wiring(ctx, turn, source, None, False)
+        runner._run_agent_bind_turn_wiring(ctx, turn, source, None, False, None)
         retired.connected = False  # the reconnect watcher retires it and publishes a new instance
         runner.adapters[Platform.TELEGRAM] = live
 

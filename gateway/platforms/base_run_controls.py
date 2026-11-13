@@ -101,3 +101,34 @@ class PlatformRunControlsMixin:
                 and self.gateway_runner is not None):
             await self.gateway_runner._clear_durable_active_turn(event)
         getattr(event, "_gateway_marker_released", asyncio.Event()).set()
+
+    async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
+        """Tell the user a turn failed rather than leaving radio silence (last resort:
+        a failing notice is logged, never raised). Returns the thread metadata used."""
+        from gateway.platforms.base import _thread_metadata_for_event, diagnostic_wake_muted, t
+        _thread_metadata = None
+        try:
+            _thread_metadata = _thread_metadata_for_event(event)
+            # Only the policy reads bind the routed profile; the send stays in the launch scope
+            # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
+            with self._media_delivery_scope(event.source):
+                content = None if diagnostic_wake_muted(event) else self.warning_text(
+                    t("gateway.errors.generic_failed"),  # raw exception text can carry credentials (logged above)
+                    t("gateway.notify.turn_error"),
+                    logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
+            if content is None:
+                return _thread_metadata
+            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+        except Exception as notify_err:
+            logger.error(
+                "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
+        return _thread_metadata
+
+    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
+        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
+        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
+        would let stale runs fire a fresher run's callbacks."""
+        from gateway.platforms.base import _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS, run_post_delivery_callback
+        await run_post_delivery_callback(self.pop_post_delivery_callback(
+            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None)),
+            _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)

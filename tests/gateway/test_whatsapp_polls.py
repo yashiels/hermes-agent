@@ -591,3 +591,30 @@ async def test_clarify_text_fallback_keeps_skip_hint(adapter):
     await adapter.send_clarify(PEER, question, [str(index) for index in range(12)], 'clarify', 'session')
     assert adapter._http_session.posts[0][0] == 'send'
     assert hint in adapter._http_session.posts[0][1]['message']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('refusal', ['deny_only', 'other_requester'])
+async def test_poll_approval_keeps_upstream_refused_request_pending(adapter, refusal):
+    entry = _enqueue('restricted')
+    entry.authority = {'requester_id': 'other' if refusal == 'other_requester' else PEER, 'approvers': []}
+    await adapter.send_exec_approval(PEER, 'guarded', 'session', request_id='restricted')
+    entry.card_deny_only = refusal == 'deny_only'
+    poll_id = _poll_ids(adapter)[-1]
+    await vote(adapter, poll_id, [ea_action_labels()['once']])
+    assert entry.result is None
+    assert poll_id in adapter._poll_bindings
+
+
+@pytest.mark.asyncio
+async def test_poll_slash_confirm_keeps_other_requesters_confirmation_pending(adapter):
+    handler = AsyncMock(return_value='done')
+    confirm_id = 'restricted-confirm'
+    slash_confirm.register('session', confirm_id, 'reset', handler, authority={
+        'requester_id': 'other', 'approvers': [],
+    })
+    await adapter.send_slash_confirm(PEER, 'Reset', 'Confirm reset', 'session', confirm_id)
+    poll_id = _poll_ids(adapter)[-1]
+    await vote(adapter, poll_id, [t('platform.whatsapp.slash_confirm_once')])
+    handler.assert_not_awaited()
+    assert poll_id in adapter._poll_bindings

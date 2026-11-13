@@ -11,6 +11,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_turn import GatewayTurnMixin
 from gateway.session import SessionSource
+from gateway.turn_context import TurnContext
 
 
 class HookAdapter(BasePlatformAdapter):
@@ -65,7 +66,7 @@ async def test_run_token_propagates_to_progress_and_status_metadata():
         _event_callback_sync=callback,
         _status_callback_sync=callback,
     )
-    turn_ctx = SimpleNamespace()
+    turn_ctx = TurnContext()
     source = SessionSource(platform=Platform.DISCORD, chat_id="1", chat_type="dm")
     runner._delivery_adapter_for = lambda _source: object()
 
@@ -113,7 +114,7 @@ async def test_flag_off_has_no_run_token_or_turn_hooks():
         _event_callback_sync=callback,
         _status_callback_sync=callback,
     )
-    turn_ctx = SimpleNamespace()
+    turn_ctx = TurnContext()
     source = SessionSource(platform=Platform.DISCORD, chat_id="1", chat_type="dm")
 
     token = GatewayTurnMixin._new_adapter_run_token(runner, source, "session-1", 1)

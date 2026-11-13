@@ -141,7 +141,10 @@ class PollClarifyMixin:
         if dispatch is None or not isinstance(binding.state, dispatch[0]):
             logger.debug("[whatsapp] Ignored unsupported poll kind or state mismatch: %s", binding.kind)
             return True
-        await dispatch[1](poll_id, binding, update.get("selectedOptions"))
+        if binding.kind == "clarify":
+            await dispatch[1](poll_id, binding, update.get("selectedOptions"))
+        else:
+            await dispatch[1](poll_id, binding, update.get("selectedOptions"), actor_id=voter)
         return True
 
     async def _handle_clarify_vote(self, poll_id, binding, selected):
@@ -173,19 +176,33 @@ class PollClarifyMixin:
         clarify_gateway.resolve_gateway_clarify(state.clarify_id, response)
         self._retire_poll(poll_id)
 
-    async def _handle_approval_vote(self, poll_id, binding, selected):
+    async def _handle_approval_vote(self, poll_id, binding, selected, *, actor_id):
         choice = _mapped_choice(binding.state.label_to_choice, selected)
         if choice is None:
             return
-        count = approval.resolve_gateway_approval(binding.session_key, choice, request_id=binding.state.request_id)
+        count = approval.resolve_gateway_approval_card(
+            binding.session_key, choice, binding.state.request_id,
+            actor_id=actor_id, extra=getattr(self.config, "extra", None) or {},
+        )
+        if not count and any(
+            entry.get("request_id") == binding.state.request_id
+            for entry in approval.list_gateway_approvals(binding.session_key)
+        ):
+            return
         self._retire_poll(poll_id)
         await self.send(binding.chat_id, t(_approval_reply_key(choice, count)))
 
-    async def _handle_slash_confirm_vote(self, poll_id, binding, selected):
+    async def _handle_slash_confirm_vote(self, poll_id, binding, selected, *, actor_id):
         choice = _mapped_choice(binding.state.label_to_choice, selected)
         if choice is None:
             return
         state = binding.state
+        from gateway.approval_actor import slash_confirm_refusal, refusal_text
+        if requester := slash_confirm_refusal(
+            binding.session_key, state.confirm_id, actor_id, extra=getattr(self.config, "extra", None) or {},
+        ):
+            await self.send(binding.chat_id, refusal_text(requester))
+            return
         self._retire_poll(poll_id)
         text = await slash_confirm.resolve(binding.session_key, state.confirm_id, choice)
         if text:

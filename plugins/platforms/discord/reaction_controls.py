@@ -97,15 +97,17 @@ class ReactionControlRegistry:
 
 async def resolve_approval_prompt(
     session_key: str, choice: str, actor: str, *, view: Any,
-    finalize: Callable[[Any, str], Awaitable[None]],
+    finalize: Callable[[Any, str], Awaitable[None]], actor_id: Any,
 ) -> int:
-    from tools.approval import resolve_gateway_approval
+    from tools.approval import resolve_gateway_approval_card
     try:
         request_id = getattr(view, "request_id", None)
-        kwargs = {"request_id": request_id} if isinstance(request_id, str) and request_id else {}
-        if kwargs:
+        if request_id:
             view._backend_settled = True
-        count = resolve_gateway_approval(session_key, choice, **kwargs)
+        count = resolve_gateway_approval_card(
+            session_key, choice, request_id, actor_id=actor_id,
+            extra=getattr(view, "approval_extra", None) or {},
+        )
     except Exception as exc:
         logger.error("[Discord] Failed to resolve gateway approval for session %s: %s", session_key, exc, exc_info=True)
         count = 0
@@ -235,6 +237,7 @@ async def _handle_approval_reaction(adapter: Any, payload: Any, entry: dict[str,
         actor = _reactor_display_name(payload)
         count = await resolve_approval_prompt(
             entry["session_key"], choice, actor, view=view, finalize=_finalize,
+            actor_id=payload.user_id,
         )
         if not count:
             logger.debug(

@@ -14,6 +14,7 @@ import pytest
 
 from gateway.platforms.base import SendResult
 from gateway.run_turn import GatewayTurnMixin
+from gateway.turn_context import TurnContext
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from tests.waiting import async_wait_until
 
@@ -88,7 +89,7 @@ async def test_flood_frozen_preview_is_finished_in_place_not_sent_twice(monkeypa
     assert not consumer.final_response_sent and not consumer.final_content_delivered
 
     response = {"final_response": final}
-    turn_ctx = SimpleNamespace(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
+    turn_ctx = TurnContext(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
                                session_key="agent:main:telegram:group:chat-1")
     await asyncio.wait_for(_Harness()._run_agent_mark_streamed_delivery(response, turn_ctx), timeout=5)
 
@@ -108,7 +109,7 @@ async def test_preview_still_flooded_past_the_retry_leaves_the_normal_send(monke
     adapter.open_at += 30  # Telegram extends the penalty
 
     response = {"final_response": final}
-    turn_ctx = SimpleNamespace(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
+    turn_ctx = TurnContext(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
                                session_key="agent:main:telegram:group:chat-1")
     await asyncio.wait_for(_Harness()._run_agent_mark_streamed_delivery(response, turn_ctx), timeout=5)
 
@@ -146,7 +147,7 @@ async def test_consumer_cancelled_mid_final_leaves_one_complete_message():
     assert not consumer.final_response_sent and consumer.message_id == "1"
 
     response = {"final_response": final}
-    turn_ctx = SimpleNamespace(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
+    turn_ctx = TurnContext(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
                                session_key="agent:main:telegram:dm:chat-1")
     await asyncio.wait_for(_Harness()._run_agent_mark_streamed_delivery(response, turn_ctx), timeout=5)
 
@@ -170,7 +171,7 @@ async def test_turn_replaced_during_the_flood_wait_publishes_nothing(monkeypatch
         current["run"] = False
 
     response = {"final_response": final}
-    turn_ctx = SimpleNamespace(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
+    turn_ctx = TurnContext(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
                                session_key="agent:main:telegram:group:chat-1")
     await asyncio.wait_for(asyncio.gather(
         _Harness()._run_agent_mark_streamed_delivery(response, turn_ctx), reset_mid_wait()), timeout=5)
@@ -228,7 +229,7 @@ async def test_an_edit_that_would_truncate_leaves_the_normal_send():
     await asyncio.gather(task, return_exceptions=True)
 
     response = {"final_response": final}
-    turn_ctx = SimpleNamespace(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
+    turn_ctx = TurnContext(stream_consumer_holder=[consumer], source=SimpleNamespace(chat_id="chat-1"),
                                session_key="agent:main:googlechat:dm:chat-1")
     await asyncio.wait_for(_Harness()._run_agent_mark_streamed_delivery(response, turn_ctx), timeout=5)
 

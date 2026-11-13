@@ -4228,27 +4228,6 @@ class BasePlatformAdapter(PlatformRunControlsMixin, _SessionModelSettingsMixin, 
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
-    async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
-        """Tell the user a turn failed rather than leaving radio silence (last resort:
-        a failing notice is logged, never raised). Returns the thread metadata used."""
-        _thread_metadata = None
-        try:
-            _thread_metadata = _thread_metadata_for_event(event)
-            # Only the policy reads bind the routed profile; the send stays in the launch scope
-            # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
-            with self._media_delivery_scope(event.source):
-                content = None if diagnostic_wake_muted(event) else self.warning_text(
-                    t("gateway.errors.generic_failed"),  # raw exception text can carry credentials (logged above)
-                    t("gateway.notify.turn_error"),
-                    logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
-            if content is None:
-                return _thread_metadata
-            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
-        except Exception as notify_err:
-            logger.error(
-                "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
-        return _thread_metadata
-
     async def _deliver_attachments(self, event: MessageEvent, extracted: _ExtractedResponse,
                                    metadata: dict[str, Any], *, anything_sent: bool,
                                    record_delivery: Callable) -> None:
@@ -4332,14 +4311,6 @@ class BasePlatformAdapter(PlatformRunControlsMixin, _SessionModelSettingsMixin, 
                 text_content = _recovered
         return footer_onto_photo_caption(self, _ExtractedResponse(text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract), _IMAGE_EXTS)  # #74547
-
-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
-        await run_post_delivery_callback(self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None)),
-            _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not

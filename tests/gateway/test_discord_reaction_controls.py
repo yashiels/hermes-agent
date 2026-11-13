@@ -7,6 +7,7 @@ import pytest
 
 from agent.i18n import t
 from gateway.config import PlatformConfig
+from tests.gateway.test_approval_answer_slash_gate import _clean_state, _raise_approval
 
 import plugins.platforms.discord.adapter as discord_platform
 from plugins.platforms.discord.adapter import DiscordAdapter, ExecApprovalView
@@ -203,8 +204,10 @@ async def test_button_and_reaction_parity_for_approval_once():
     async def reaction_cb():
         callback_calls["reaction"] += 1
 
+    button_entry = _raise_approval("button-session", "discord", requester="42")
+    reaction_entry = _raise_approval("reaction-session", "discord", requester="42")
     button_view = ExecApprovalView(
-        session_key="button-session", allowed_user_ids={"42"},
+        session_key="button-session", allowed_user_ids={"42"}, request_id=button_entry.data["request_id"],
         approval_state_callback=button_cb,
     )
     interaction, button_embed = _interaction()
@@ -213,7 +216,7 @@ async def test_button_and_reaction_parity_for_approval_once():
     adapter._allowed_user_ids = {"42"}
     reaction_message = FakeMessage("reaction-msg")
     reaction_view = ExecApprovalView(
-        session_key="reaction-session", allowed_user_ids={"42"},
+        session_key="reaction-session", allowed_user_ids={"42"}, request_id=reaction_entry.data["request_id"],
         approval_state_callback=reaction_cb,
     )
     adapter._reaction_registry.register_approval(
@@ -222,7 +225,9 @@ async def test_button_and_reaction_parity_for_approval_once():
     )
 
     reactor = SimpleNamespace(roles=[], display_name="alice")
-    with patch("tools.approval.resolve_gateway_approval", return_value=1):
+    from tools import approval
+
+    with patch("tools.approval.resolve_gateway_approval", wraps=approval.resolve_gateway_approval):
         await button_view._resolve(interaction, "once")
         payload = SimpleNamespace(user_id=42, message_id="reaction-msg", emoji=EMOJI_APPROVE, member=reactor, guild_id=None)
         await handle_raw_reaction_add(adapter, payload)
@@ -262,11 +267,9 @@ async def test_button_and_reaction_share_the_approval_lock():
     adapter = _make_adapter(reaction_controls=True)
     adapter._allowed_user_ids = {"42"}
 
-    calls = []
+    from tools import approval
 
-    def fake_resolve(session_key, choice):
-        calls.append((session_key, choice))
-        return 1 if len(calls) == 1 else 0
+    entry = _raise_approval("shared-session", "discord", requester="42")
 
     callback_calls = {"n": 0}
 
@@ -274,7 +277,7 @@ async def test_button_and_reaction_share_the_approval_lock():
         callback_calls["n"] += 1
 
     shared_view = ExecApprovalView(
-        session_key="shared-session", allowed_user_ids={"42"},
+        session_key="shared-session", allowed_user_ids={"42"}, request_id=entry.data["request_id"],
         approval_state_callback=cb, lock_registry=adapter._reaction_registry,
     )
     reaction_message = FakeMessage("shared-msg")
@@ -288,13 +291,14 @@ async def test_button_and_reaction_share_the_approval_lock():
     reactor = SimpleNamespace(roles=[], display_name="alice")
     payload = SimpleNamespace(user_id=42, message_id="shared-msg", emoji=EMOJI_APPROVE, member=reactor, guild_id=None)
 
-    with patch("tools.approval.resolve_gateway_approval", side_effect=fake_resolve):
+    with patch("tools.approval.resolve_gateway_approval", wraps=approval.resolve_gateway_approval) as resolve:
         await asyncio.gather(
             shared_view._resolve(interaction, "once"),
             handle_raw_reaction_add(adapter, payload),
         )
 
-    assert len(calls) == 1
+    resolve.assert_called_once_with("shared-session", "once", request_id=entry.data["request_id"])
+    assert entry.result == "once"
     assert callback_calls == {"n": 1}
     assert shared_view.resolved is True
 
@@ -318,9 +322,12 @@ async def test_reaction_controls_recheck_snapshot_principal_against_live_policy(
         retry_if_last=AsyncMock(return_value=True),
     )
     adapter.set_gateway_controls(controls)
+    from tools import approval
+
+    entry = _raise_approval("control-session", "discord", requester="42")
     message = FakeMessage("control-msg")
     view = ExecApprovalView(
-        session_key="control-session", allowed_user_ids={"42"},
+        session_key="control-session", allowed_user_ids={"42"}, request_id=entry.data["request_id"],
         require_admin=require_admin, admin_user_ids={"42"},
     )
     if emoji in (EMOJI_APPROVE, EMOJI_DENY):
@@ -339,7 +346,7 @@ async def test_reaction_controls_recheck_snapshot_principal_against_live_policy(
         member=SimpleNamespace(roles=[], display_name="alice"),
     )
     with patch("gateway.pairing.PairingStore") as pairing, patch(
-        "tools.approval.resolve_gateway_approval", return_value=1,
+        "tools.approval.resolve_gateway_approval", wraps=approval.resolve_gateway_approval,
     ) as resolve:
         pairing.return_value.is_approved.return_value = False
         await handle_raw_reaction_add(adapter, payload)
@@ -354,17 +361,20 @@ async def test_reaction_controls_recheck_snapshot_principal_against_live_policy(
 async def test_reaction_settlement_is_bound_and_keeps_its_answer(monkeypatch):
     from plugins.platforms.discord.reaction_controls import resolve_approval_prompt
 
-    view = ExecApprovalView(session_key="s", allowed_user_ids={"42"}, request_id="request-1")
+    from tools import approval
+
+    entry = _raise_approval("s", "discord", requester="42")
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"42"}, request_id=entry.data["request_id"])
     expire = AsyncMock()
     monkeypatch.setattr(view, "_expire_embed", expire)
     async def finalized(*_):
         await view.retire("resolved")
 
     finalize = AsyncMock(side_effect=finalized)
-    with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
-        count = await resolve_approval_prompt("s", "once", "alice", view=view, finalize=finalize)
+    with patch("tools.approval.resolve_gateway_approval", wraps=approval.resolve_gateway_approval) as resolve:
+        count = await resolve_approval_prompt("s", "once", "alice", view=view, finalize=finalize, actor_id="42")
 
     assert count == 1
-    resolve.assert_called_once_with("s", "once", request_id="request-1")
+    resolve.assert_called_once_with("s", "once", request_id=entry.data["request_id"])
     finalize.assert_awaited_once()
     expire.assert_not_awaited()
